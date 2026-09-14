@@ -1,0 +1,7 @@
+# Copy to .dev.vars for local `wrangler dev` (never commit .dev.vars)
+
+APP_ID=123456
+WEBHOOK_SECRET=replace-with-your-webhook-secret
+# PKCS#8 PEM; use \n for newlines if stored on one line, or a real multiline value in .dev.vars
+PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+GEMINI_API_KEY=your-google-ai-studio-key

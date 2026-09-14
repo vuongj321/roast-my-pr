@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+.wrangler-bundle/
+.dev.vars
+.mf/
+dist/
+*.pem
+private-key*.pem
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+worker-configuration.d.ts

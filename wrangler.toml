@@ -1,0 +1,19 @@
+name = "roast-my-pr"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "00000000000000000000000000000000"
+preview_id = "00000000000000000000000000000000"
+
+# Replace the KV ids above after running:
+#   npx wrangler kv namespace create RATE_LIMIT
+#   npx wrangler kv namespace create RATE_LIMIT --preview
+# Then put the real ids here (or use `wrangler deploy` with updated bindings).
+
+[vars]
+GEMINI_MODEL = "gemini-2.0-flash"
+DAILY_ROAST_LIMIT = "20"
+MAX_DIFF_CHARS = "80000"

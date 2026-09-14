@@ -1,0 +1,29 @@
+{
+  "name": "roast-my-pr",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted GitHub App that roasts PRs on /roastmypr using Gemini free tier",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@octokit/auth-app": "^7.1.5",
+    "@octokit/rest": "^21.1.1",
+    "@octokit/webhooks-methods": "^5.1.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
