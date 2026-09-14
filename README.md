@@ -74,7 +74,7 @@ Optional vars in `wrangler.toml` (not secret):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Model id with free-tier access in your AI Studio project |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Model id with free-tier access in your AI Studio project |
 | `DAILY_ROAST_LIMIT` | `20` | Soft per-installation daily cap |
 | `MAX_DIFF_CHARS` | `80000` | Max diff characters sent to Gemini |
 

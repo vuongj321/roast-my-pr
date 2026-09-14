@@ -1,5 +1,6 @@
 import { verify } from "@octokit/webhooks-methods";
 import { handleIssueComment } from "./app.js";
+import { formatGithubError } from "./github.js";
 import type { Env } from "./types.js";
 
 function json(data: unknown, status = 200): Response {
@@ -54,7 +55,7 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
     try {
       await handleIssueComment(env, payload);
     } catch (err) {
-      console.error("Unhandled issue_comment error", err);
+      console.error("Unhandled issue_comment error", formatGithubError(err));
       // Still 200 so GitHub does not hammer retries for app bugs.
     }
   } else if (event === "ping") {

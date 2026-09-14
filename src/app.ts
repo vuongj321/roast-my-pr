@@ -3,6 +3,7 @@ import { isPullRequestComment, parseCommand } from "./command.js";
 import {
   createAppOctokit,
   fetchPullDiff,
+  formatGithubError,
   postComment,
 } from "./github.js";
 import {
@@ -111,7 +112,7 @@ export async function handleIssueComment(
       "\n\n---\n*Roasted by **Roast my PR** · self-hosted free-tier bot*";
     await postComment(octokit, owner, repo, number, `${roast}${footer}`);
   } catch (err) {
-    console.error("Roast failed", err);
+    console.error("Roast failed", formatGithubError(err));
     if (err instanceof GeminiQuotaError) {
       await postComment(octokit, owner, repo, number, QUOTA_COMMENT);
       return;

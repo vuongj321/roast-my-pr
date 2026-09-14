@@ -64,4 +64,4 @@ When you deploy for real, change the App webhook URL to your Worker URL and rede
 1. Open [Google AI Studio](https://aistudio.google.com/apikey) and create an API key
 2. Stay on the **free tier** project if you want $0 cost
 3. Store as `GEMINI_API_KEY`
-4. Optional: set `GEMINI_MODEL` (default `gemini-2.0-flash`) to a model that still shows Free Tier in AI Studio for your project
+4. Optional: set `GEMINI_MODEL` (default `gemini-3.6-flash`) to a model that still shows Free Tier in AI Studio for your project

@@ -7,6 +7,41 @@ function normalizePrivateKey(pem: string): string {
   return pem.includes("\\n") ? pem.replace(/\\n/g, "\n") : pem;
 }
 
+/**
+ * Pull status + GitHub JSON body out of Octokit/fetch errors for Worker logs.
+ */
+export function formatGithubError(err: unknown): string {
+  if (!err || typeof err !== "object") {
+    return String(err);
+  }
+
+  const e = err as {
+    message?: string;
+    status?: number;
+    response?: {
+      url?: string;
+      data?: unknown;
+      headers?: Record<string, string>;
+    };
+  };
+
+  const parts: string[] = [];
+  if (typeof e.status === "number") parts.push(`status=${e.status}`);
+  if (e.response?.url) parts.push(`url=${e.response.url}`);
+  if (e.message) parts.push(e.message);
+
+  const data = e.response?.data;
+  if (data !== undefined) {
+    try {
+      parts.push(`body=${typeof data === "string" ? data : JSON.stringify(data)}`);
+    } catch {
+      parts.push("body=[unserializable]");
+    }
+  }
+
+  return parts.length > 0 ? parts.join(" | ") : String(err);
+}
+
 export function createAppOctokit(env: Env, installationId: number): Octokit {
   return new Octokit({
     authStrategy: createAppAuth,

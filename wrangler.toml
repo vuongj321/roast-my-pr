@@ -5,8 +5,8 @@ compatibility_flags = ["nodejs_compat"]
 
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
-id = "00000000000000000000000000000000"
-preview_id = "00000000000000000000000000000000"
+id = "af87c3ce926d46ca9ef4f047f556ddea"
+preview_id = "c431bd763676408ba1d9a70bd903f5f1"
 
 # Replace the KV ids above after running:
 #   npx wrangler kv namespace create RATE_LIMIT
@@ -14,6 +14,13 @@ preview_id = "00000000000000000000000000000000"
 # Then put the real ids here (or use `wrangler deploy` with updated bindings).
 
 [vars]
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 DAILY_ROAST_LIMIT = "20"
 MAX_DIFF_CHARS = "80000"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
