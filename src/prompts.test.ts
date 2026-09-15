@@ -54,6 +54,7 @@ describe("buildUserPrompt", () => {
     assert.match(prompt, /Missing transactions/);
     assert.match(prompt, /claims to re-check/);
     assert.match(prompt, /Only repeat an issue/);
+    assert.doesNotMatch(prompt, /Evidence:/);
   });
 
   it("truncates a long prior roast inside the prompt", () => {
@@ -68,8 +69,9 @@ describe("buildUserPrompt", () => {
 });
 
 describe("ROAST_SYSTEM_PROMPT", () => {
-  it("requires Evidence quotes in the output format", () => {
-    assert.match(ROAST_SYSTEM_PROMPT, /Evidence:/);
-    assert.match(ROAST_SYSTEM_PROMPT, /Never fabricate an Evidence quote/);
+  it("keeps soft prior-roast rules without Evidence requirements", () => {
+    assert.match(ROAST_SYSTEM_PROMPT, /hypotheses to re-check/);
+    assert.match(ROAST_SYSTEM_PROMPT, /already present in the packed diff/);
+    assert.doesNotMatch(ROAST_SYSTEM_PROMPT, /Evidence:/);
   });
 });

@@ -1,35 +1,15 @@
 /**
- * Drop roast bullets whose Evidence quotes are not present in the packed diff.
- * Soft prompt rules are not enough for weak free-tier failover models.
+ * Light post-filter: drop roast bullets that cite file paths not present
+ * in the packed diff. Does not require Evidence quotes.
  */
 
-export const MIN_EVIDENCE_CHARS = 12;
+import { extractCitedPaths, matchesPriorityPath } from "./diffPack.js";
 
-export const UNSUBSTANTIATED_FALLBACK =
-  "Could not substantiate findings against the packed diff. Every claim lacked a verbatim quote that appears in the provided code—or the model invented the quotes.";
+export const PATH_STRIPPED_NOTE =
+  "_Note: Some bullets cited files that were not in the packed diff and were omitted._";
 
-export const STRIPPED_NOTE =
-  "_Note: Unsupported claims (missing or unverifiable Evidence quotes) were stripped._";
-
-const EVIDENCE_RE = /Evidence:\s*`([^`]+)`/i;
-
-export function normalizeForEvidenceMatch(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-export function evidenceAppearsInDiff(
-  evidence: string,
-  packedDiff: string,
-): boolean {
-  const needle = normalizeForEvidenceMatch(evidence);
-  if (needle.length < MIN_EVIDENCE_CHARS) return false;
-  return normalizeForEvidenceMatch(packedDiff).includes(needle);
-}
-
-export function extractEvidenceQuote(block: string): string | null {
-  const match = EVIDENCE_RE.exec(block);
-  return match?.[1]?.trim() || null;
-}
+export const INCOMPLETE_PACK_NOTE =
+  "_Note: The model only cited files outside the packed diff, so detailed bullets were omitted. The review may be incomplete._";
 
 /** Split a section body into bullet blocks (`-` / `*` / numbered). */
 export function splitBulletBlocks(sectionBody: string): string[] {
@@ -48,12 +28,7 @@ export function splitBulletBlocks(sectionBody: string): string[] {
       flush();
       current.push(line);
     } else if (current.length > 0) {
-      // Continuations: blank lines, indented wraps, or Evidence on the next line.
-      if (
-        /^\s*$/.test(line) ||
-        /^\s+\S/.test(line) ||
-        /^\s*Evidence:/i.test(line)
-      ) {
+      if (/^\s*$/.test(line) || /^\s+\S/.test(line)) {
         current.push(line);
       } else {
         flush();
@@ -80,23 +55,40 @@ function classifyHeading(line: string): SectionName | null {
   const t = line.replace(/^#+\s*/, "").trim().toLowerCase();
   if (/what i'?d send back/.test(t)) return "sendBack";
   if (/^fix it\b/.test(t)) return "fixIt";
-  if (/^#{1,3}\s/.test(line.trim()) || /^\*\*[^*]+\*\*\s*$/.test(line.trim())) {
+  if (
+    /^#{1,3}\s/.test(line.trim()) ||
+    /^\*\*[^*]+\*\*\s*$/.test(line.trim())
+  ) {
     return "other";
   }
   return null;
 }
 
+/** True if every path cited in the bullet is among packed filenames. */
+export function bulletPathsArePacked(
+  block: string,
+  packedFilenames: ReadonlySet<string> | readonly string[],
+): boolean {
+  const packed =
+    packedFilenames instanceof Set
+      ? packedFilenames
+      : new Set(packedFilenames);
+  const cited = extractCitedPaths(block);
+  if (cited.length === 0) return true;
+  return cited.every((p) => matchesPriorityPath(p, packed));
+}
+
 /**
- * Filter roast markdown: keep send-back / fix-it bullets only when Evidence
- * is present and appears in packedDiff.
+ * Filter roast markdown: drop bullets that cite paths outside the packed set.
+ * Always returns postable text (never fails the provider).
  */
-export function filterRoastByEvidence(
+export function filterRoastByPackedPaths(
   roastText: string,
-  packedDiff: string,
+  packedFilenames: ReadonlySet<string> | readonly string[],
 ): { text: string; kept: number; dropped: number } {
   const raw = (roastText || "").trim();
   if (!raw) {
-    return { text: UNSUBSTANTIATED_FALLBACK, kept: 0, dropped: 0 };
+    return { text: raw, kept: 0, dropped: 0 };
   }
 
   const lines = raw.split(/\r?\n/);
@@ -127,11 +119,7 @@ export function filterRoastByEvidence(
   for (const line of lines) {
     const heading = classifyHeading(line);
     if (heading === "sendBack") {
-      if (mode === "preamble") {
-        // keep preamble as-is
-      } else {
-        flushSection();
-      }
+      if (mode !== "preamble") flushSection();
       mode = "sendBack";
       sectionBuf = [];
       continue;
@@ -157,7 +145,6 @@ export function filterRoastByEvidence(
   }
   flushSection();
 
-  // If we never found structured sections, try filtering all top-level bullets.
   let keptSend: string[] = [];
   let keptFix: string[] = [];
   let dropped = 0;
@@ -165,8 +152,7 @@ export function filterRoastByEvidence(
   const filterBlocks = (blocks: string[]): string[] => {
     const kept: string[] = [];
     for (const block of blocks) {
-      const quote = extractEvidenceQuote(block);
-      if (quote && evidenceAppearsInDiff(quote, packedDiff)) {
+      if (bulletPathsArePacked(block, packedFilenames)) {
         kept.push(block);
       } else {
         dropped += 1;
@@ -175,26 +161,21 @@ export function filterRoastByEvidence(
     return kept;
   };
 
-  if (sendBackBlocks.length === 0 && fixItBlocks.length === 0) {
-    const all = splitBulletBlocks(raw);
-    if (all.length === 0) {
-      return { text: UNSUBSTANTIATED_FALLBACK, kept: 0, dropped: 0 };
-    }
-    keptSend = filterBlocks(all);
-  } else {
-    keptSend = filterBlocks(sendBackBlocks);
-    // Fix-it: keep only bullets with matching Evidence; drop Evidence-less fix items.
-    keptFix = filterBlocks(fixItBlocks);
+  const structured = sendBackBlocks.length > 0 || fixItBlocks.length > 0;
+  if (!structured) {
+    // No recognizable sections — leave the roast as-is.
+    return { text: raw, kept: 0, dropped: 0 };
   }
 
+  keptSend = filterBlocks(sendBackBlocks);
+  keptFix = filterBlocks(fixItBlocks);
   const kept = keptSend.length + keptFix.length;
-  if (kept === 0) {
-    return { text: UNSUBSTANTIATED_FALLBACK, kept: 0, dropped };
-  }
 
   const parts: string[] = [];
-  if (kept < 2) {
-    parts.push(STRIPPED_NOTE, "");
+  if (dropped > 0 && kept === 0) {
+    parts.push(INCOMPLETE_PACK_NOTE, "");
+  } else if (dropped > 0) {
+    parts.push(PATH_STRIPPED_NOTE, "");
   }
 
   const pre = preamble.join("\n").trim();
@@ -210,8 +191,9 @@ export function filterRoastByEvidence(
   const trail = trailing.join("\n").trim();
   if (trail) parts.push(trail);
 
+  const text = parts.join("\n").trim();
   return {
-    text: parts.join("\n").trim(),
+    text: text || raw,
     kept,
     dropped,
   };

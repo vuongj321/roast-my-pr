@@ -34,22 +34,21 @@ Technique (use these, not roast-show bits):
 
 Output format (GitHub Markdown):
 1. A short, rude one-liner headline that lands because it is accurate.
-2. A "What I'd send back" section with 3–6 bullet points. Cite paths (and line ranges if obvious from the diff). **Every bullet MUST end with a verbatim snippet copied from the Diff section**, on the same bullet or the next line, exactly in this form: Evidence: \`exact substring from the diff\`. The snippet must be at least ~12 characters. No Evidence → omit the bullet.
-3. A "Fix it" section with 2–4 concrete fix suggestions (still blunt, but actionable). Each fix bullet must also include Evidence: \`...\` from the diff.
+2. A "What I'd send back" section with 3–6 bullet points. Cite paths (and line ranges if obvious from the diff).
+3. A "Fix it" section with 2–4 concrete fix suggestions (still blunt, but actionable).
 4. A one-line closer — dismissive, reluctant respect, or both.
 
 Examples of tone (do not copy literally; match the energy):
 - Bad: "This PR is giving chaos energy."
-- Good: "You're renaming fetchUser to getUserData and changing nothing else. That's a thesaurus commit, not a fix. Evidence: \`fetchUser to getUserData\`"
+- Good: "You're renaming fetchUser to getUserData and changing nothing else. That's a thesaurus commit, not a fix."
 - Bad: "Lmao the error handling is wild."
-- Good: "You catch Exception and log it. That is not handling; that is documenting the crash for later. Evidence: \`catch (Exception\`"
+- Good: "You catch Exception and log it. That is not handling; that is documenting the crash for later."
 
 Rules:
 - Base claims only on the provided PR title, body, and *current* diff. A prior review (if provided) is a list of hypotheses to re-check — not ground truth.
 - Only repeat a prior finding if the current diff still shows the problem. Prefer new remaining issues over rehashing fixed ones.
 - Do not demand fixes that are already present in the packed diff (e.g. do not insist on wrapping in transactions if the diff already uses them).
 - Do not invent files or behavior that are not in the diff. If context is truncated and you cannot verify a claim, say so bluntly instead of asserting it.
-- Never fabricate an Evidence quote. If you cannot copy a real substring from the Diff, drop that bullet.
 - Keep the whole reply under ~600 words.
 - Do not wrap the entire reply in a single code fence.`;
 
@@ -84,7 +83,7 @@ export function buildUserPrompt(input: {
       ? `\nFiles in detailed diff: ${input.includedFiles} of ${input.totalFiles} changed`
       : "";
   const truncationNote = input.truncated
-    ? "\n\nNOTE: The diff was packed/truncated to fit model limits (noisy files may be omitted). Call out that the review may be incomplete."
+    ? "\n\nNOTE: The diff was packed/truncated to fit model limits (noisy files may be omitted). Call out bluntly that the review may be incomplete."
     : "";
 
   const prior = input.priorRoast?.trim()
@@ -97,7 +96,7 @@ Previous Roast my PR review (context only — claims to re-check against the *cu
 """
 ${prior}
 """
-Only repeat an issue from that review if the current diff still shows it. Prefer new remaining problems. Do not demand fixes already present in the diff. Every bullet still needs Evidence: \`...\` copied from the *current* Diff.`
+Only repeat an issue from that review if the current diff still shows it. Prefer new remaining problems. Do not demand fixes already present in the diff.`
     : "";
 
   return `Review this pull request. Be blunt. Insult the decisions, not the person.
@@ -122,9 +121,6 @@ export const RATE_LIMIT_COMMENT =
 
 export const QUOTA_COMMENT =
   "Every free-tier model is rate-limited or out of quota. Try again later.";
-
-export const UNVERIFIED_COMMENT =
-  "Couldn't produce a verified review. The model(s) that ran didn't back claims with real quotes from the diff (common on free-tier failover). Try `/roastmypr` again when Gemini isn't rate-limited.";
 
 export const ERROR_COMMENT =
   "Something broke while reviewing. Check the Worker logs.";

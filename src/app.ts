@@ -11,15 +11,10 @@ import {
   ERROR_COMMENT,
   QUOTA_COMMENT,
   RATE_LIMIT_COMMENT,
-  UNVERIFIED_COMMENT,
   buildRoastFooter,
 } from "./prompts.js";
 import { consumeRoastSlot } from "./rateLimit.js";
-import {
-  RoastQuotaError,
-  RoastUnverifiedError,
-  generateRoast,
-} from "./roast.js";
+import { RoastQuotaError, generateRoast } from "./roast.js";
 
 interface IssueCommentPayload {
   action?: string;
@@ -118,10 +113,6 @@ export async function handleIssueComment(
     console.error("Roast failed", formatGithubError(err));
     if (err instanceof RoastQuotaError) {
       await postComment(octokit, owner, repo, number, QUOTA_COMMENT);
-      return;
-    }
-    if (err instanceof RoastUnverifiedError) {
-      await postComment(octokit, owner, repo, number, UNVERIFIED_COMMENT);
       return;
     }
     await postComment(octokit, owner, repo, number, ERROR_COMMENT);

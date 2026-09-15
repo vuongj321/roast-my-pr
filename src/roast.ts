@@ -7,7 +7,7 @@ import {
   type PackOptions,
   type ProviderName,
 } from "./diffPack.js";
-import { filterRoastByEvidence } from "./evidenceFilter.js";
+import { filterRoastByPackedPaths } from "./pathFilter.js";
 import { buildUserPrompt, ROAST_SYSTEM_PROMPT } from "./prompts.js";
 
 export class RoastQuotaError extends Error {
@@ -21,14 +21,6 @@ export class RoastError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RoastError";
-  }
-}
-
-/** Model replied but no bullets survived Evidence verification. */
-export class RoastUnverifiedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "RoastUnverifiedError";
   }
 }
 
@@ -54,8 +46,6 @@ type ProviderFailure = {
   provider: string;
   message: string;
   quotaLike: boolean;
-  /** True when the model replied but Evidence filter kept nothing. */
-  evidenceEmpty?: boolean;
 };
 
 interface GeminiResponse {
@@ -134,7 +124,12 @@ function budgetForProvider(env: Env, provider: ProviderName): PackOptions {
 function buildPackedPrompt(
   input: RoastInput,
   budget: PackOptions,
-): { userPrompt: string; truncated: boolean; packedDiff: string } {
+): {
+  userPrompt: string;
+  truncated: boolean;
+  packedDiff: string;
+  includedFilenames: string[];
+} {
   const priorityPaths = new Set(extractCitedPaths(input.priorRoast || ""));
   const packed = packPullContext(
     input.files,
@@ -146,6 +141,7 @@ function buildPackedPrompt(
   return {
     truncated: packed.truncated,
     packedDiff: packed.diff,
+    includedFilenames: packed.includedFilenames,
     userPrompt: buildUserPrompt({
       owner: input.owner,
       repo: input.repo,
@@ -372,22 +368,29 @@ function isTooLargeError(err: unknown): boolean {
 
 /**
  * Call a provider; on prompt-too-large, shrink the packed diff and retry once.
- * Returns roast text plus the packed diff used for evidence verification.
+ * Returns roast text plus the packed filenames used for path filtering.
  */
 async function runWithShrinkRetry(
   input: RoastInput,
   provider: ProviderName,
   budget: PackOptions,
   call: (userPrompt: string) => Promise<string>,
-): Promise<{ text: string; packedDiff: string }> {
+): Promise<{
+  text: string;
+  packedDiff: string;
+  includedFilenames: string[];
+}> {
   let current = budget;
   let lastErr: unknown;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { userPrompt, packedDiff } = buildPackedPrompt(input, current);
+    const { userPrompt, packedDiff, includedFilenames } = buildPackedPrompt(
+      input,
+      current,
+    );
     try {
       const text = await call(userPrompt);
-      return { text, packedDiff };
+      return { text, packedDiff, includedFilenames };
     } catch (err) {
       lastErr = err;
       if (attempt === 0 && isTooLargeError(err)) {
@@ -420,7 +423,11 @@ export async function generateRoast(
     name: ProviderName;
     model: string;
     enabled: boolean;
-    run: () => Promise<{ text: string; packedDiff: string }>;
+    run: () => Promise<{
+      text: string;
+      packedDiff: string;
+      includedFilenames: string[];
+    }>;
   }> = [
     {
       name: "gemini",
@@ -474,25 +481,20 @@ export async function generateRoast(
 
   for (const attempt of configured) {
     try {
-      const { text, packedDiff } = await attempt.run();
-      const filtered = filterRoastByEvidence(text, packedDiff);
-      if (filtered.dropped > 0) {
-        console.error(
-          `Roast evidence filter (${attempt.name}): kept=${filtered.kept} dropped=${filtered.dropped}`,
-        );
-      }
-      // Empty verified review is not useful — treat as provider failure and try next.
-      if (filtered.kept === 0) {
+      const { text, includedFilenames } = await attempt.run();
+      if (!text.trim()) {
         failures.push({
           provider: attempt.name,
-          message: "evidence filter dropped all bullets",
+          message: `${attempt.name} returned an empty roast.`,
           quotaLike: false,
-          evidenceEmpty: true,
         });
-        console.error(
-          `Roast provider ${attempt.name}: no verifiable Evidence quotes; trying next provider`,
-        );
         continue;
+      }
+      const filtered = filterRoastByPackedPaths(text, includedFilenames);
+      if (filtered.dropped > 0) {
+        console.error(
+          `Roast path filter (${attempt.name}): kept=${filtered.kept} dropped=${filtered.dropped}`,
+        );
       }
       return {
         text: filtered.text,
@@ -513,16 +515,9 @@ export async function generateRoast(
     .map((f) => `${f.provider}: ${f.message}`)
     .join(" | ");
   const allQuotaLike = failures.every((f) => f.quotaLike);
-  const onlyUnverifiedOrQuota = failures.every(
-    (f) => f.quotaLike || f.evidenceEmpty,
-  );
-  const anyUnverified = failures.some((f) => f.evidenceEmpty);
 
   if (allQuotaLike) {
     throw new RoastQuotaError(summary);
-  }
-  if (anyUnverified && onlyUnverifiedOrQuota) {
-    throw new RoastUnverifiedError(summary);
   }
   throw new RoastError(summary);
 }

@@ -127,7 +127,7 @@ src/
   command.ts         /roastmypr parsing
   github.ts          App auth, PR context fetch, comments
   diffPack.ts        Noise filtering + per-provider diff budgets
-  evidenceFilter.ts  Strip bullets without Evidence in packed diff
+  pathFilter.ts      Strip bullets citing paths outside packed set
   roast.ts           LLM client (Gemini → Groq → Workers AI)
   prompts.ts         Roast personality
   rateLimit.ts       KV daily caps

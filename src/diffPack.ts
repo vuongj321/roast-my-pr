@@ -28,6 +28,8 @@ export type PackedContext = {
   diff: string;
   truncated: boolean;
   includedFiles: number;
+  /** Filenames that received a detailed pack block. */
+  includedFilenames: string[];
   totalFiles: number;
   omitted: Array<{ filename: string; reason: string }>;
 };
@@ -268,6 +270,7 @@ export function packPullContext(
     diff: `${chunks.join("\n")}${buildInventory(omitted)}`,
     truncated: truncated || omitted.length > 0,
     includedFiles: included.size,
+    includedFilenames: [...included],
     totalFiles: files.length,
     omitted,
   };

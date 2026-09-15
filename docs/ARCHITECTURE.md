@@ -107,7 +107,7 @@ The Worker sends:
 - A **system prompt** (roast personality, rules, output shape)
 - A **user payload** (PR title, body, **packed** file patches)
 
-Packing is **provider-specific**. Gemini can take a larger diff; Groq’s free-tier **8K TPM** forces a tighter pack; Workers AI uses a moderate pack to preserve the daily neuron budget. On failover we rebuild a pack for that provider instead of resending the Gemini-sized prompt. Noisy files (lockfiles, images, `dist/`, etc.) are skipped and listed as omitted so the model still knows they changed. Paths cited in a prior roast are packed first. After the model replies, bullets without a verbatim `Evidence:` quote present in the packed diff are stripped.
+Packing is **provider-specific**. Gemini can take a larger diff; Groq’s free-tier **8K TPM** forces a tighter pack; Workers AI uses a moderate pack to preserve the daily neuron budget. On failover we rebuild a pack for that provider instead of resending the Gemini-sized prompt. Noisy files (lockfiles, images, `dist/`, etc.) are skipped and listed as omitted so the model still knows they changed. Paths cited in a prior roast are packed first. After the model replies, bullets that cite file paths **not** in the packed set are stripped (light filter — not a hard Evidence-quote gate).
 
 The first successful provider returns text; the Worker posts that text to GitHub. Gemini and Groq are external HTTP APIs; Workers AI runs through Cloudflare’s `env.AI` binding.
 
@@ -138,7 +138,7 @@ sequenceDiagram
     Worker->>Worker: Pack diff (boost prior-cited paths; provider budget)
     Worker->>LLM: Gemini then Groq then Workers AI (prior roast as hypotheses)
     LLM-->>Worker: Roast markdown
-    Worker->>Worker: Strip bullets without Evidence in packed diff
+    Worker->>Worker: Strip bullets citing paths outside packed set
     Worker->>GitHub: Post roast comment on PR
   end
   Worker-->>GitHub: HTTP 200
@@ -163,7 +163,7 @@ sequenceDiagram
 
 7. **Context load** — Fetch PR title, body, changed files, and patches. Also load the latest prior Roast my PR comment on the thread (footer-marked), if any. Paths cited there are prioritized when packing so re-roasts can actually verify old findings. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
 
-8. **Roast generation** — For each provider (Gemini → Groq → Workers AI): pack the file list into that provider’s character budget, attach a truncated prior roast (if any) as claims to re-verify, call the API/binding, and on “request too large” shrink 50% and retry once. Then **evidence-filter** the reply: keep only bullets whose `Evidence: \`...\`` quote appears in the packed diff. If a provider keeps zero bullets, treat that as a failure and try the next provider. If every attempt is quota/empty-evidence, post a short “try again when Gemini is free” note — never post an empty “no findings” fallback as if the PR were clean. Skip Groq if its key is unset; skip Workers AI if the `AI` binding is missing.
+8. **Roast generation** — For each provider (Gemini → Groq → Workers AI): pack the file list into that provider’s character budget, attach a truncated prior roast (if any) as claims to re-verify, call the API/binding, and on “request too large” shrink 50% and retry once. Then apply a **light path filter**: drop bullets that cite file paths not included in the packed set. Always post a non-empty model reply after that filter (do not fail the provider when bullets are stripped). Skip Groq if its key is unset; skip Workers AI if the `AI` binding is missing.
 
 9. **Final comment** — Post one markdown comment on the PR (v1 does not create inline review threads on specific lines).
 
@@ -180,7 +180,7 @@ roast-my-pr/
     app.ts                   # issue_comment handling and /roastmypr routing
     github.ts                # App JWT, installation Octokit, PR context, comments
     diffPack.ts              # Noise filtering + per-provider diff budgets
-    evidenceFilter.ts        # Strip bullets without Evidence in packed diff
+    pathFilter.ts            # Strip bullets citing paths outside packed set
     roast.ts                 # LLM client with Gemini → Groq → Workers AI failover
     prompts.ts               # Roast personality and output format
     rateLimit.ts             # Optional KV daily caps
@@ -195,8 +195,8 @@ roast-my-pr/
 | `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, roast, and reply |
 | `github.ts` | All GitHub API interaction through Octokit (including prior roast lookup) |
 | `diffPack.ts` | Skip noisy files, prioritize source / prior-cited paths, pack patches to a budget |
-| `evidenceFilter.ts` | Drop roast bullets whose Evidence quotes are not in the packed diff |
-| `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover, evidence filter |
+| `pathFilter.ts` | Drop roast bullets that cite file paths not in the packed set |
+| `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover, path filter |
 | `prompts.ts` | Prompt text kept separate so tone can be tuned without touching I/O |
 | `rateLimit.ts` | Read/increment KV counters |
 
