@@ -284,15 +284,15 @@ export const PROVIDER_DIFF_BUDGETS = {
    */
   gemini: { maxTotalChars: 48_000, maxPerFileChars: 6_000, maxBodyChars: 2_500 },
   /**
-   * Groq free `openai/gpt-oss-20b`: 8K TPM (not per-request). Stay under so
-   * system + prior roast + max_tokens still fit in one minute's budget.
+   * Groq free `openai/gpt-oss-20b`: 8K TPM (not per-request). Keep the first
+   * attempt small so a shrink-retry is not required (retries burn the same minute).
    */
-  groq: { maxTotalChars: 10_000, maxPerFileChars: 2_000, maxBodyChars: 1_000 },
+  groq: { maxTotalChars: 6_000, maxPerFileChars: 1_500, maxBodyChars: 800 },
   /**
    * Workers AI free plan: 10k Neurons/day. Moderate pack so failover still sees
    * key files without burning the daily neuron budget on one mega-prompt.
    */
-  workersai: { maxTotalChars: 32_000, maxPerFileChars: 4_000, maxBodyChars: 2_000 },
+  workersai: { maxTotalChars: 24_000, maxPerFileChars: 3_500, maxBodyChars: 1_500 },
 } as const;
 
 export type ProviderName = keyof typeof PROVIDER_DIFF_BUDGETS;

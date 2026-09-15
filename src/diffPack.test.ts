@@ -113,7 +113,7 @@ describe("packPullContext", () => {
     assert.ok(
       packed.body.length <= PROVIDER_DIFF_BUDGETS.groq.maxBodyChars + 50,
     );
-    assert.ok(packed.diff.length < 15_000);
+    assert.ok(packed.diff.length < 10_000);
   });
 
   it("packs prior-cited paths before other source files", () => {

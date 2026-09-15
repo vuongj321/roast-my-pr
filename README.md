@@ -83,13 +83,13 @@ Optional vars in `wrangler.toml` (not secret):
 | --- | --- | --- |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Primary model id (AI Studio free tier) |
 | `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq fallback model |
-| `WORKERS_AI_MODEL` | `@cf/zai-org/glm-4.7-flash` | Workers AI failover model |
+| `WORKERS_AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Workers AI failover model |
 | `DAILY_ROAST_LIMIT` | `20` | Soft per-installation daily cap |
 | `MAX_DIFF_CHARS` | `48000` | Ceiling on packed diff size (per-provider budgets are lower for Groq) |
 
 Failover order: **Gemini → Groq → Workers AI**. Groq is skipped if its API key is unset; Workers AI runs when the `AI` binding is present.
 
-Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized, and each provider gets a budget that fits its free-tier limits. If a provider still rejects the prompt as too large, the Worker shrinks the pack and retries once.
+Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized, and each provider gets a budget that fits its free-tier limits. If a provider rejects the prompt as too large or returns an empty completion, the Worker shrinks the pack and retries once.
 
 ### 5. Run locally
 

@@ -19,7 +19,7 @@ binding = "AI"
 [vars]
 GEMINI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
-WORKERS_AI_MODEL = "@cf/zai-org/glm-4.7-flash"
+WORKERS_AI_MODEL = "@cf/google/gemma-4-26b-a4b-it"
 DAILY_ROAST_LIMIT = "20"
 # Global ceiling applied on top of per-provider budgets (see src/diffPack.ts).
 MAX_DIFF_CHARS = "48000"

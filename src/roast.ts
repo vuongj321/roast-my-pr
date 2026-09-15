@@ -9,6 +9,12 @@ import {
 } from "./diffPack.js";
 import { filterRoastByPackedPaths } from "./pathFilter.js";
 import { buildUserPrompt, ROAST_SYSTEM_PROMPT } from "./prompts.js";
+import {
+  extractModelText,
+  isTruncatedRoastText,
+  isUsableRoastText,
+  logEmptyCompletionPayload,
+} from "./responseText.js";
 
 export class RoastQuotaError extends Error {
   constructor(message: string) {
@@ -50,10 +56,14 @@ type ProviderFailure = {
 
 interface GeminiResponse {
   candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
+    content?: {
+      parts?: Array<{ text?: string; thought?: boolean }>;
+    };
+    finishReason?: string;
   }>;
   error?: { message?: string; status?: string; code?: number };
 }
+
 
 interface OpenAIChatResponse {
   choices?: Array<{
@@ -167,7 +177,9 @@ function groqModel(env: Env): string {
 }
 
 function workersAiModel(env: Env): string {
-  return env.WORKERS_AI_MODEL || "@cf/zai-org/glm-4.7-flash";
+  // Prefer instruct models that fill `content`/`response`. GLM often leaves
+  // content null and only fills `reasoning` with planning notes.
+  return env.WORKERS_AI_MODEL || "@cf/google/gemma-4-26b-a4b-it";
 }
 
 export type RoastResult = {
@@ -195,7 +207,14 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
       ],
       generationConfig: {
         temperature: 0.9,
-        maxOutputTokens: 2048,
+        // Thinking tokens count against this cap; keep headroom for the roast body.
+        maxOutputTokens: 8192,
+        // Gemini 3.x defaults to MEDIUM thinking and can burn the whole budget
+        // before finishing the markdown reply (finishReason MAX_TOKENS mid-bullet).
+        thinkingConfig: {
+          thinkingLevel: "minimal",
+          thinkingBudget: 0,
+        },
       },
     }),
   });
@@ -211,19 +230,34 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
     throw Object.assign(new Error(message), {
       quotaLike,
       tooLarge: isPromptTooLargeMessage(message),
+      emptyCompletion: false,
     });
   }
 
-  const text = data.candidates?.[0]?.content?.parts
-    ?.map((p) => p.text || "")
+  const candidate = data.candidates?.[0];
+  const text = (candidate?.content?.parts || [])
+    .filter((p) => !p.thought)
+    .map((p) => p.text || "")
     .join("")
     .trim();
 
-  if (!text) {
-    throw Object.assign(new Error("Gemini returned an empty roast."), {
-      quotaLike: false,
-      tooLarge: false,
-    });
+  const finishReason = candidate?.finishReason || "";
+  const truncatedByApi = /MAX_TOKENS/i.test(finishReason);
+  if (
+    !text ||
+    !isUsableRoastText(text) ||
+    truncatedByApi ||
+    isTruncatedRoastText(text)
+  ) {
+    logEmptyCompletionPayload("Gemini", data);
+    throw Object.assign(
+      new Error(
+        truncatedByApi || isTruncatedRoastText(text)
+          ? "Gemini returned a truncated roast."
+          : "Gemini returned an empty roast.",
+      ),
+      { quotaLike: false, tooLarge: false, emptyCompletion: true },
+    );
   }
 
   return text;
@@ -235,7 +269,10 @@ async function callOpenAICompatible(options: {
   apiKey: string;
   model: string;
   userPrompt: string;
+  maxTokens?: number;
   extraHeaders?: Record<string, string>;
+  /** Extra OpenAI-compatible body fields (e.g. Groq reasoning controls). */
+  extraBody?: Record<string, unknown>;
 }): Promise<string> {
   const res = await fetch(options.url, {
     method: "POST",
@@ -247,11 +284,12 @@ async function callOpenAICompatible(options: {
     body: JSON.stringify({
       model: options.model,
       temperature: 0.9,
-      max_tokens: 2048,
+      max_tokens: options.maxTokens ?? 2048,
       messages: [
         { role: "system", content: ROAST_SYSTEM_PROMPT },
         { role: "user", content: options.userPrompt },
       ],
+      ...options.extraBody,
     }),
   });
 
@@ -265,37 +303,20 @@ async function callOpenAICompatible(options: {
     throw Object.assign(new Error(message), {
       quotaLike,
       tooLarge: isPromptTooLargeMessage(message),
+      emptyCompletion: false,
     });
   }
 
-  const text = data.choices?.[0]?.message?.content?.trim();
+  const text = extractModelText(data);
   if (!text) {
+    logEmptyCompletionPayload(options.provider, data);
     throw Object.assign(
       new Error(`${options.provider} returned an empty roast.`),
-      { quotaLike: false, tooLarge: false },
+      { quotaLike: false, tooLarge: false, emptyCompletion: true },
     );
   }
 
   return text;
-}
-
-function textFromWorkersAiResult(data: unknown): string {
-  if (!data || typeof data !== "object") return "";
-  const obj = data as Record<string, unknown>;
-
-  if (typeof obj.response === "string" && obj.response.trim()) {
-    return obj.response.trim();
-  }
-
-  const choices = obj.choices;
-  if (Array.isArray(choices) && choices[0] && typeof choices[0] === "object") {
-    const message = (choices[0] as { message?: { content?: string | null } })
-      .message;
-    const content = message?.content?.trim();
-    if (content) return content;
-  }
-
-  return "";
 }
 
 async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
@@ -303,25 +324,37 @@ async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
     throw Object.assign(new Error("Workers AI binding is not configured."), {
       quotaLike: false,
       tooLarge: false,
+      emptyCompletion: false,
     });
   }
 
   const model = workersAiModel(env);
   try {
-    const raw = await env.AI.run(model as Parameters<Ai["run"]>[0], {
+    const inputs: Record<string, unknown> = {
       messages: [
         { role: "system", content: ROAST_SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
       ],
       max_tokens: 2048,
       temperature: 0.9,
-    } as Parameters<Ai["run"]>[1]);
+    };
+    // GLM defaults thinking on; disable when using that family.
+    if (/glm/i.test(model)) {
+      inputs.thinking = { type: "disabled" };
+    }
 
-    const text = textFromWorkersAiResult(raw);
+    const raw = await env.AI.run(
+      model as Parameters<Ai["run"]>[0],
+      inputs as Parameters<Ai["run"]>[1],
+    );
+
+    const text = extractModelText(raw);
     if (!text) {
+      logEmptyCompletionPayload("Workers AI", raw);
       throw Object.assign(new Error("Workers AI returned an empty roast."), {
         quotaLike: false,
         tooLarge: false,
+        emptyCompletion: true,
       });
     }
     return text;
@@ -330,7 +363,7 @@ async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
       err &&
       typeof err === "object" &&
       "quotaLike" in err &&
-      "tooLarge" in err
+      ("tooLarge" in err || "emptyCompletion" in err)
     ) {
       throw err;
     }
@@ -339,6 +372,7 @@ async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
     throw Object.assign(new Error(message), {
       quotaLike: isQuotaLikeMessage(message),
       tooLarge: isPromptTooLargeMessage(message),
+      emptyCompletion: false,
     });
   }
 }
@@ -366,8 +400,16 @@ function isTooLargeError(err: unknown): boolean {
   return false;
 }
 
+function isEmptyCompletionError(err: unknown): boolean {
+  if (typeof err === "object" && err !== null && "emptyCompletion" in err) {
+    return Boolean((err as { emptyCompletion?: boolean }).emptyCompletion);
+  }
+  if (err instanceof Error) return /empty roast/i.test(err.message);
+  return false;
+}
+
 /**
- * Call a provider; on prompt-too-large, shrink the packed diff and retry once.
+ * Call a provider; on prompt-too-large or empty completion, shrink and retry once.
  * Returns roast text plus the packed filenames used for path filtering.
  */
 async function runWithShrinkRetry(
@@ -393,9 +435,18 @@ async function runWithShrinkRetry(
       return { text, packedDiff, includedFilenames };
     } catch (err) {
       lastErr = err;
-      if (attempt === 0 && isTooLargeError(err)) {
+      // Groq free tier is 8k TPM: an empty→shrink retry often rate-limits the
+      // second call. Only shrink there on explicit "too large" errors.
+      const emptyOkToShrink =
+        isEmptyCompletionError(err) && provider !== "groq";
+      const shouldShrink =
+        attempt === 0 && (isTooLargeError(err) || emptyOkToShrink);
+      if (shouldShrink) {
+        const reason = isEmptyCompletionError(err)
+          ? "empty completion"
+          : "prompt too large";
         console.error(
-          `Roast provider ${provider}: prompt too large, retrying at 50% budget`,
+          `Roast provider ${provider}: ${reason}, retrying at 50% budget`,
         );
         current = scaleBudget(current, 0.5);
         continue;
@@ -457,6 +508,14 @@ export async function generateRoast(
               apiKey: env.GROQ_API_KEY!,
               model: groqModel(env),
               userPrompt,
+              // Stay inside free-tier 8k TPM with room for one attempt.
+              maxTokens: 1024,
+              // gpt-oss puts CoT in `reasoning` and often leaves `content` empty
+              // unless reasoning is hidden / effort lowered.
+              extraBody: {
+                include_reasoning: false,
+                reasoning_effort: "low",
+              },
             }),
         ),
     },
