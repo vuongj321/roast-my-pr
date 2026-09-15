@@ -99,8 +99,8 @@ export async function handleIssueComment(
     });
 
     const footer =
-      "\n\n---\n*Roasted by **Roast my PR** · self-hosted free-tier bot*";
-    await postComment(octokit, owner, repo, number, `${roast}${footer}`);
+      `\n\n---\n*Reviewed by **Roast my PR** · \`${roast.model}\` · self-hosted free-tier bot*`;
+    await postComment(octokit, owner, repo, number, `${roast.text}${footer}`);
   } catch (err) {
     console.error("Roast failed", formatGithubError(err));
     if (err instanceof RoastQuotaError) {

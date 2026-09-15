@@ -25,7 +25,7 @@ function htmlHome(): Response {
 </head>
 <body>
   <h1>Roast my PR</h1>
-  <p>Self-hosted GitHub App. Comment <code>/roastmypr</code> on a pull request to get roasted.</p>
+  <p>Self-hosted GitHub App. Comment <code>/roastmypr</code> on a pull request for a blunt review.</p>
   <p>Webhook endpoint: <code>POST /api/github/webhooks</code></p>
   <p>See the repo README for setup.</p>
 </body>

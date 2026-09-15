@@ -140,8 +140,26 @@ function buildPackedPrompt(
   };
 }
 
+function geminiModel(env: Env): string {
+  return env.GEMINI_MODEL || "gemini-3.6-flash";
+}
+
+function groqModel(env: Env): string {
+  return env.GROQ_MODEL || "openai/gpt-oss-20b";
+}
+
+function openRouterModel(env: Env): string {
+  return env.OPENROUTER_MODEL || "openrouter/free";
+}
+
+export type RoastResult = {
+  text: string;
+  provider: ProviderName;
+  model: string;
+};
+
 async function callGemini(env: Env, userPrompt: string): Promise<string> {
-  const model = env.GEMINI_MODEL || "gemini-3.6-flash";
+  const model = geminiModel(env);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
   const res = await fetch(url, {
@@ -307,16 +325,18 @@ async function runWithShrinkRetry(
 export async function generateRoast(
   env: Env,
   input: RoastInput,
-): Promise<string> {
+): Promise<RoastResult> {
   const failures: ProviderFailure[] = [];
 
   const attempts: Array<{
     name: ProviderName;
+    model: string;
     enabled: boolean;
     run: () => Promise<string>;
   }> = [
     {
       name: "gemini",
+      model: geminiModel(env),
       enabled: Boolean(env.GEMINI_API_KEY),
       run: () =>
         runWithShrinkRetry(
@@ -328,6 +348,7 @@ export async function generateRoast(
     },
     {
       name: "groq",
+      model: groqModel(env),
       enabled: Boolean(env.GROQ_API_KEY),
       run: () =>
         runWithShrinkRetry(
@@ -339,13 +360,14 @@ export async function generateRoast(
               provider: "Groq",
               url: "https://api.groq.com/openai/v1/chat/completions",
               apiKey: env.GROQ_API_KEY!,
-              model: env.GROQ_MODEL || "openai/gpt-oss-20b",
+              model: groqModel(env),
               userPrompt,
             }),
         ),
     },
     {
       name: "openrouter",
+      model: openRouterModel(env),
       enabled: Boolean(env.OPENROUTER_API_KEY),
       run: () =>
         runWithShrinkRetry(
@@ -357,7 +379,7 @@ export async function generateRoast(
               provider: "OpenRouter",
               url: "https://openrouter.ai/api/v1/chat/completions",
               apiKey: env.OPENROUTER_API_KEY!,
-              model: env.OPENROUTER_MODEL || "openrouter/free",
+              model: openRouterModel(env),
               userPrompt,
               extraHeaders: {
                 "HTTP-Referer": "https://github.com/roast-my-pr",
@@ -375,7 +397,8 @@ export async function generateRoast(
 
   for (const attempt of configured) {
     try {
-      return await attempt.run();
+      const text = await attempt.run();
+      return { text, provider: attempt.name, model: attempt.model };
     } catch (err) {
       const failure = failureFromUnknown(attempt.name, err);
       failures.push(failure);
