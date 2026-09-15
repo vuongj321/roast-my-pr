@@ -1,7 +1,38 @@
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
 import type { DiffFile } from "./diffPack.js";
+import { ROAST_FOOTER_MARKER } from "./prompts.js";
 import type { Env } from "./types.js";
+
+export type IssueCommentLike = {
+  id: number;
+  body?: string | null;
+};
+
+export function isRoastBotComment(body: string | null | undefined): boolean {
+  return Boolean(body && body.includes(ROAST_FOOTER_MARKER));
+}
+
+/**
+ * Pick the most recent prior roast body from issue comments (oldest→newest order).
+ */
+export function selectLatestPriorRoast(
+  comments: IssueCommentLike[],
+  excludeCommentId?: number,
+): string | null {
+  let latest: string | null = null;
+  for (const comment of comments) {
+    if (
+      excludeCommentId !== undefined &&
+      comment.id === excludeCommentId
+    ) {
+      continue;
+    }
+    if (!isRoastBotComment(comment.body)) continue;
+    latest = (comment.body || "").trim();
+  }
+  return latest || null;
+}
 
 function normalizePrivateKey(pem: string): string {
   // Support secrets stored with literal \n sequences.
@@ -129,6 +160,45 @@ export async function fetchPullContext(
     files,
     filesIncomplete,
   };
+}
+
+/**
+ * Load the latest prior Roast my PR comment on this issue/PR (footer-marked).
+ * Caps at ~100 comments to keep Worker latency bounded.
+ */
+export async function fetchLatestPriorRoast(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  excludeCommentId?: number,
+): Promise<string | null> {
+  const comments: IssueCommentLike[] = [];
+  const perPage = 100;
+  const { data } = await octokit.rest.issues.listComments({
+    owner,
+    repo,
+    issue_number: issueNumber,
+    per_page: perPage,
+    page: 1,
+  });
+  for (const c of data) {
+    comments.push({ id: c.id, body: c.body });
+  }
+  // One page is enough for typical PRs; if full, take one more page of newest.
+  if (data.length === perPage) {
+    const { data: page2 } = await octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: perPage,
+      page: 2,
+    });
+    for (const c of page2) {
+      comments.push({ id: c.id, body: c.body });
+    }
+  }
+  return selectLatestPriorRoast(comments, excludeCommentId);
 }
 
 /** @deprecated Use fetchPullContext */

@@ -1,11 +1,13 @@
 import type { Env } from "./types.js";
 import {
   PROVIDER_DIFF_BUDGETS,
+  extractCitedPaths,
   packPullContext,
   type DiffFile,
   type PackOptions,
   type ProviderName,
 } from "./diffPack.js";
+import { filterRoastByEvidence } from "./evidenceFilter.js";
 import { buildUserPrompt, ROAST_SYSTEM_PROMPT } from "./prompts.js";
 
 export class RoastQuotaError extends Error {
@@ -19,6 +21,14 @@ export class RoastError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RoastError";
+  }
+}
+
+/** Model replied but no bullets survived Evidence verification. */
+export class RoastUnverifiedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RoastUnverifiedError";
   }
 }
 
@@ -36,12 +46,16 @@ export type RoastInput = {
   author: string;
   files: DiffFile[];
   filesIncomplete: boolean;
+  /** Latest prior bot roast body, if any (verified against current diff). */
+  priorRoast?: string | null;
 };
 
 type ProviderFailure = {
   provider: string;
   message: string;
   quotaLike: boolean;
+  /** True when the model replied but Evidence filter kept nothing. */
+  evidenceEmpty?: boolean;
 };
 
 interface GeminiResponse {
@@ -68,7 +82,10 @@ function isQuotaLikeMessage(message: string): boolean {
     lower.includes("quota") ||
     lower.includes("capacity") ||
     lower.includes("too many requests") ||
-    lower.includes("overloaded")
+    lower.includes("overloaded") ||
+    lower.includes("neurons") ||
+    lower.includes("out of capacity") ||
+    lower.includes("3040")
   );
 }
 
@@ -82,7 +99,8 @@ function isPromptTooLargeMessage(message: string): boolean {
     lower.includes("maximum context") ||
     lower.includes("too many tokens") ||
     lower.includes("prompt is too long") ||
-    lower.includes("payload too large")
+    lower.includes("payload too large") ||
+    lower.includes("3006")
   );
 }
 
@@ -116,15 +134,18 @@ function budgetForProvider(env: Env, provider: ProviderName): PackOptions {
 function buildPackedPrompt(
   input: RoastInput,
   budget: PackOptions,
-): { userPrompt: string; truncated: boolean } {
+): { userPrompt: string; truncated: boolean; packedDiff: string } {
+  const priorityPaths = new Set(extractCitedPaths(input.priorRoast || ""));
   const packed = packPullContext(
     input.files,
     input.body,
     budget,
     input.filesIncomplete,
+    priorityPaths,
   );
   return {
     truncated: packed.truncated,
+    packedDiff: packed.diff,
     userPrompt: buildUserPrompt({
       owner: input.owner,
       repo: input.repo,
@@ -136,6 +157,7 @@ function buildPackedPrompt(
       truncated: packed.truncated,
       includedFiles: packed.includedFiles,
       totalFiles: packed.totalFiles,
+      priorRoast: input.priorRoast,
     }),
   };
 }
@@ -148,8 +170,8 @@ function groqModel(env: Env): string {
   return env.GROQ_MODEL || "openai/gpt-oss-20b";
 }
 
-function openRouterModel(env: Env): string {
-  return env.OPENROUTER_MODEL || "openrouter/free";
+function workersAiModel(env: Env): string {
+  return env.WORKERS_AI_MODEL || "@cf/zai-org/glm-4.7-flash";
 }
 
 export type RoastResult = {
@@ -261,6 +283,70 @@ async function callOpenAICompatible(options: {
   return text;
 }
 
+function textFromWorkersAiResult(data: unknown): string {
+  if (!data || typeof data !== "object") return "";
+  const obj = data as Record<string, unknown>;
+
+  if (typeof obj.response === "string" && obj.response.trim()) {
+    return obj.response.trim();
+  }
+
+  const choices = obj.choices;
+  if (Array.isArray(choices) && choices[0] && typeof choices[0] === "object") {
+    const message = (choices[0] as { message?: { content?: string | null } })
+      .message;
+    const content = message?.content?.trim();
+    if (content) return content;
+  }
+
+  return "";
+}
+
+async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
+  if (!env.AI) {
+    throw Object.assign(new Error("Workers AI binding is not configured."), {
+      quotaLike: false,
+      tooLarge: false,
+    });
+  }
+
+  const model = workersAiModel(env);
+  try {
+    const raw = await env.AI.run(model as Parameters<Ai["run"]>[0], {
+      messages: [
+        { role: "system", content: ROAST_SYSTEM_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+      max_tokens: 2048,
+      temperature: 0.9,
+    } as Parameters<Ai["run"]>[1]);
+
+    const text = textFromWorkersAiResult(raw);
+    if (!text) {
+      throw Object.assign(new Error("Workers AI returned an empty roast."), {
+        quotaLike: false,
+        tooLarge: false,
+      });
+    }
+    return text;
+  } catch (err) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "quotaLike" in err &&
+      "tooLarge" in err
+    ) {
+      throw err;
+    }
+    const message =
+      err instanceof Error ? err.message : "Workers AI failed unexpectedly";
+    throw Object.assign(new Error(message), {
+      quotaLike: isQuotaLikeMessage(message),
+      tooLarge: isPromptTooLargeMessage(message),
+    });
+  }
+}
+
 function failureFromUnknown(provider: string, err: unknown): ProviderFailure {
   const message =
     err instanceof Error ? err.message : `${provider} failed unexpectedly`;
@@ -286,20 +372,22 @@ function isTooLargeError(err: unknown): boolean {
 
 /**
  * Call a provider; on prompt-too-large, shrink the packed diff and retry once.
+ * Returns roast text plus the packed diff used for evidence verification.
  */
 async function runWithShrinkRetry(
   input: RoastInput,
   provider: ProviderName,
   budget: PackOptions,
   call: (userPrompt: string) => Promise<string>,
-): Promise<string> {
+): Promise<{ text: string; packedDiff: string }> {
   let current = budget;
   let lastErr: unknown;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { userPrompt } = buildPackedPrompt(input, current);
+    const { userPrompt, packedDiff } = buildPackedPrompt(input, current);
     try {
-      return await call(userPrompt);
+      const text = await call(userPrompt);
+      return { text, packedDiff };
     } catch (err) {
       lastErr = err;
       if (attempt === 0 && isTooLargeError(err)) {
@@ -319,7 +407,7 @@ async function runWithShrinkRetry(
 }
 
 /**
- * Generate a roast via Gemini, falling back to Groq then OpenRouter on failure.
+ * Generate a roast via Gemini, falling back to Groq then Workers AI on failure.
  * Each provider gets a budget-sized pack of the same PR files (not one shared megaprompt).
  */
 export async function generateRoast(
@@ -332,7 +420,7 @@ export async function generateRoast(
     name: ProviderName;
     model: string;
     enabled: boolean;
-    run: () => Promise<string>;
+    run: () => Promise<{ text: string; packedDiff: string }>;
   }> = [
     {
       name: "gemini",
@@ -366,26 +454,15 @@ export async function generateRoast(
         ),
     },
     {
-      name: "openrouter",
-      model: openRouterModel(env),
-      enabled: Boolean(env.OPENROUTER_API_KEY),
+      name: "workersai",
+      model: workersAiModel(env),
+      enabled: Boolean(env.AI),
       run: () =>
         runWithShrinkRetry(
           input,
-          "openrouter",
-          budgetForProvider(env, "openrouter"),
-          (userPrompt) =>
-            callOpenAICompatible({
-              provider: "OpenRouter",
-              url: "https://openrouter.ai/api/v1/chat/completions",
-              apiKey: env.OPENROUTER_API_KEY!,
-              model: openRouterModel(env),
-              userPrompt,
-              extraHeaders: {
-                "HTTP-Referer": "https://github.com/roast-my-pr",
-                "X-Title": "Roast my PR",
-              },
-            }),
+          "workersai",
+          budgetForProvider(env, "workersai"),
+          (userPrompt) => callWorkersAi(env, userPrompt),
         ),
     },
   ];
@@ -397,8 +474,31 @@ export async function generateRoast(
 
   for (const attempt of configured) {
     try {
-      const text = await attempt.run();
-      return { text, provider: attempt.name, model: attempt.model };
+      const { text, packedDiff } = await attempt.run();
+      const filtered = filterRoastByEvidence(text, packedDiff);
+      if (filtered.dropped > 0) {
+        console.error(
+          `Roast evidence filter (${attempt.name}): kept=${filtered.kept} dropped=${filtered.dropped}`,
+        );
+      }
+      // Empty verified review is not useful — treat as provider failure and try next.
+      if (filtered.kept === 0) {
+        failures.push({
+          provider: attempt.name,
+          message: "evidence filter dropped all bullets",
+          quotaLike: false,
+          evidenceEmpty: true,
+        });
+        console.error(
+          `Roast provider ${attempt.name}: no verifiable Evidence quotes; trying next provider`,
+        );
+        continue;
+      }
+      return {
+        text: filtered.text,
+        provider: attempt.name,
+        model: attempt.model,
+      };
     } catch (err) {
       const failure = failureFromUnknown(attempt.name, err);
       failures.push(failure);
@@ -413,9 +513,16 @@ export async function generateRoast(
     .map((f) => `${f.provider}: ${f.message}`)
     .join(" | ");
   const allQuotaLike = failures.every((f) => f.quotaLike);
+  const onlyUnverifiedOrQuota = failures.every(
+    (f) => f.quotaLike || f.evidenceEmpty,
+  );
+  const anyUnverified = failures.some((f) => f.evidenceEmpty);
 
   if (allQuotaLike) {
     throw new RoastQuotaError(summary);
+  }
+  if (anyUnverified && onlyUnverifiedOrQuota) {
+    throw new RoastUnverifiedError(summary);
   }
   throw new RoastError(summary);
 }

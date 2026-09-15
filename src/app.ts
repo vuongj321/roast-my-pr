@@ -2,6 +2,7 @@ import type { Env } from "./types.js";
 import { isPullRequestComment, parseCommand } from "./command.js";
 import {
   createAppOctokit,
+  fetchLatestPriorRoast,
   fetchPullContext,
   formatGithubError,
   postComment,
@@ -10,9 +11,15 @@ import {
   ERROR_COMMENT,
   QUOTA_COMMENT,
   RATE_LIMIT_COMMENT,
+  UNVERIFIED_COMMENT,
+  buildRoastFooter,
 } from "./prompts.js";
 import { consumeRoastSlot } from "./rateLimit.js";
-import { RoastQuotaError, generateRoast } from "./roast.js";
+import {
+  RoastQuotaError,
+  RoastUnverifiedError,
+  generateRoast,
+} from "./roast.js";
 
 interface IssueCommentPayload {
   action?: string;
@@ -76,7 +83,17 @@ export async function handleIssueComment(
   }
 
   try {
-    const pull = await fetchPullContext(octokit, owner, repo, number);
+    const excludeCommentId = payload.comment?.id;
+    const [pull, priorRoast] = await Promise.all([
+      fetchPullContext(octokit, owner, repo, number),
+      fetchLatestPriorRoast(
+        octokit,
+        owner,
+        repo,
+        number,
+        excludeCommentId,
+      ),
+    ]);
 
     const roast = await generateRoast(env, {
       owner,
@@ -87,15 +104,24 @@ export async function handleIssueComment(
       author: pull.author,
       files: pull.files,
       filesIncomplete: pull.filesIncomplete,
+      priorRoast,
     });
 
-    const footer =
-      `\n\n---\n*Reviewed by **Roast my PR** · \`${roast.model}\` · self-hosted free-tier bot*`;
-    await postComment(octokit, owner, repo, number, `${roast.text}${footer}`);
+    await postComment(
+      octokit,
+      owner,
+      repo,
+      number,
+      `${roast.text}${buildRoastFooter(roast.model)}`,
+    );
   } catch (err) {
     console.error("Roast failed", formatGithubError(err));
     if (err instanceof RoastQuotaError) {
       await postComment(octokit, owner, repo, number, QUOTA_COMMENT);
+      return;
+    }
+    if (err instanceof RoastUnverifiedError) {
+      await postComment(octokit, owner, repo, number, UNVERIFIED_COMMENT);
       return;
     }
     await postComment(octokit, owner, repo, number, ERROR_COMMENT);

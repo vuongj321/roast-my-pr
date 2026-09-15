@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  extractCitedPaths,
   filePriority,
   isNoiseFile,
+  matchesPriorityPath,
   packPullContext,
   PROVIDER_DIFF_BUDGETS,
 } from "./diffPack.js";
@@ -21,6 +23,32 @@ describe("filePriority", () => {
     assert.ok(filePriority("src/app.ts") < filePriority("README.md"));
     assert.ok(filePriority("src/app.ts") < filePriority("src/app.test.ts"));
     assert.ok(filePriority("src/app.ts") < filePriority("package-lock.json"));
+  });
+});
+
+describe("extractCitedPaths / matchesPriorityPath", () => {
+  it("extracts backtick and bare paths from prior roast text", () => {
+    const paths = extractCitedPaths(
+      "See `apps/api/src/orgs/orgs.service.ts` and apps/api/src/auth/auth.controller.ts please",
+    );
+    assert.ok(paths.includes("apps/api/src/orgs/orgs.service.ts"));
+    assert.ok(paths.includes("apps/api/src/auth/auth.controller.ts"));
+  });
+
+  it("matches full paths and basenames", () => {
+    const set = new Set([
+      "apps/api/src/orgs/orgs.service.ts",
+      "auth.controller.ts",
+    ]);
+    assert.equal(
+      matchesPriorityPath("apps/api/src/orgs/orgs.service.ts", set),
+      true,
+    );
+    assert.equal(
+      matchesPriorityPath("apps/api/src/auth/auth.controller.ts", set),
+      true,
+    );
+    assert.equal(matchesPriorityPath("src/other.ts", set), false);
   });
 });
 
@@ -69,7 +97,7 @@ describe("packPullContext", () => {
     assert.ok(packed.diff.length < 6_000);
   });
 
-  it("groq budget stays far under an 8k-token-ish ceiling", () => {
+  it("groq budget stays under an 8k-TPM-ish ceiling", () => {
     const files = Array.from({ length: 40 }, (_, i) => ({
       filename: `src/mod${i}.ts`,
       status: "modified",
@@ -82,8 +110,43 @@ describe("packPullContext", () => {
       PROVIDER_DIFF_BUDGETS.groq,
     );
 
-    // Diff + body should be well under ~28k chars (~8k tokens at ~3.5 chars/token).
-    assert.ok(packed.body.length <= PROVIDER_DIFF_BUDGETS.groq.maxBodyChars + 50);
-    assert.ok(packed.diff.length < 20_000);
+    assert.ok(
+      packed.body.length <= PROVIDER_DIFF_BUDGETS.groq.maxBodyChars + 50,
+    );
+    assert.ok(packed.diff.length < 15_000);
+  });
+
+  it("packs prior-cited paths before other source files", () => {
+    const files = [
+      {
+        filename: "src/a.ts",
+        status: "modified",
+        patch: `@@\n${"a".repeat(900)}\n`,
+      },
+      {
+        filename: "apps/api/src/orgs/orgs.service.ts",
+        status: "modified",
+        patch: `@@\n${"IMPORTANT_ORG_CODE".repeat(20)}\n`,
+      },
+      {
+        filename: "src/b.ts",
+        status: "modified",
+        patch: `@@\n${"b".repeat(900)}\n`,
+      },
+    ];
+
+    const packed = packPullContext(
+      files,
+      "body",
+      { maxTotalChars: 1_200, maxPerFileChars: 800, maxBodyChars: 100 },
+      false,
+      new Set(["apps/api/src/orgs/orgs.service.ts"]),
+    );
+
+    assert.match(packed.diff, /IMPORTANT_ORG_CODE/);
+    const orgIdx = packed.diff.indexOf("orgs.service.ts");
+    const aIdx = packed.diff.indexOf("src/a.ts");
+    assert.ok(orgIdx >= 0);
+    if (aIdx >= 0) assert.ok(orgIdx < aIdx);
   });
 });

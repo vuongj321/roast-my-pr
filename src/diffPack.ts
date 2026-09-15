@@ -78,6 +78,57 @@ export function filePriority(filename: string): number {
   return 20;
 }
 
+const PATH_EXT =
+  /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|swift|rb|php|cs|c|cpp|h|hpp|vue|svelte|json|ya?ml|toml|md|sql)$/i;
+
+/**
+ * Pull path-like citations out of prior roast text (backticks or bare paths).
+ */
+export function extractCitedPaths(text: string): string[] {
+  if (!text?.trim()) return [];
+  const found = new Set<string>();
+
+  const backtick = /`([^`\n]+)`/g;
+  let m: RegExpExecArray | null;
+  while ((m = backtick.exec(text)) !== null) {
+    const candidate = m[1].trim().replace(/\\/g, "/");
+    if (candidate.includes("/") && PATH_EXT.test(candidate)) {
+      found.add(candidate.replace(/^\.\//, ""));
+    } else if (PATH_EXT.test(candidate) && !candidate.includes(" ")) {
+      // basename-only citation e.g. `orgs.service.ts`
+      found.add(candidate);
+    }
+  }
+
+  const bare =
+    /(?:^|[\s*([<])((?:[\w.-]+\/)+[\w.-]+\.[A-Za-z0-9]+)/g;
+  while ((m = bare.exec(text)) !== null) {
+    const candidate = m[1].replace(/\\/g, "/").replace(/[),.;:]+$/, "");
+    if (PATH_EXT.test(candidate)) found.add(candidate);
+  }
+
+  return [...found];
+}
+
+/** True if this changed file was cited in a prior roast. */
+export function matchesPriorityPath(
+  filename: string,
+  priorityPaths: ReadonlySet<string>,
+): boolean {
+  if (priorityPaths.size === 0) return false;
+  const norm = filename.replace(/\\/g, "/");
+  const base = norm.split("/").pop() || norm;
+  for (const raw of priorityPaths) {
+    const p = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!p) continue;
+    if (norm === p || norm.endsWith(`/${p}`) || p.endsWith(`/${norm}`)) {
+      return true;
+    }
+    if (!p.includes("/") && base === p) return true;
+  }
+  return false;
+}
+
 function truncatePatch(
   patch: string,
   maxChars: number,
@@ -121,16 +172,19 @@ function buildInventory(
 
 /**
  * Build a packed diff + body that fits within character budgets.
+ * Files cited in a prior roast (priorityPaths) are packed first.
  */
 export function packPullContext(
   files: DiffFile[],
   body: string,
   options: PackOptions,
   filesIncomplete = false,
+  priorityPaths?: ReadonlySet<string>,
 ): PackedContext {
   const maxTotal = Math.max(2_000, options.maxTotalChars);
   const maxPerFile = Math.max(400, options.maxPerFileChars);
   const maxBody = Math.max(200, options.maxBodyChars);
+  const boost = priorityPaths ?? new Set<string>();
 
   let packedBody = body?.trim() ? body.trim() : "(no description)";
   let truncated = filesIncomplete;
@@ -145,7 +199,13 @@ export function packPullContext(
   let used = 0;
 
   const ranked = files
-    .map((file, index) => ({ file, index, priority: filePriority(file.filename) }))
+    .map((file, index) => ({
+      file,
+      index,
+      priority: matchesPriorityPath(file.filename, boost)
+        ? 0
+        : filePriority(file.filename),
+    }))
     .sort((a, b) => a.priority - b.priority || a.index - b.index);
 
   for (const { file } of ranked) {
@@ -215,12 +275,21 @@ export function packPullContext(
 
 /** Default packing budgets by provider (diff portion; leave room for system + metadata). */
 export const PROVIDER_DIFF_BUDGETS = {
-  /** Gemini Flash free tier — large context; keep latency reasonable. */
+  /**
+   * Gemini 3.6 Flash: ~1M context; free tier is RPM/TPM limited in AI Studio.
+   * Cap for latency, not hard context.
+   */
   gemini: { maxTotalChars: 48_000, maxPerFileChars: 6_000, maxBodyChars: 2_500 },
-  /** Groq free on_demand TPM is often ~8k tokens/request — stay well under. */
-  groq: { maxTotalChars: 12_000, maxPerFileChars: 2_500, maxBodyChars: 1_200 },
-  /** OpenRouter free models vary; moderate budget. */
-  openrouter: { maxTotalChars: 24_000, maxPerFileChars: 4_000, maxBodyChars: 2_000 },
+  /**
+   * Groq free `openai/gpt-oss-20b`: 8K TPM (not per-request). Stay under so
+   * system + prior roast + max_tokens still fit in one minute's budget.
+   */
+  groq: { maxTotalChars: 10_000, maxPerFileChars: 2_000, maxBodyChars: 1_000 },
+  /**
+   * Workers AI free plan: 10k Neurons/day. Moderate pack so failover still sees
+   * key files without burning the daily neuron budget on one mega-prompt.
+   */
+  workersai: { maxTotalChars: 32_000, maxPerFileChars: 4_000, maxBodyChars: 2_000 },
 } as const;
 
 export type ProviderName = keyof typeof PROVIDER_DIFF_BUDGETS;
