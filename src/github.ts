@@ -1,5 +1,6 @@
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
+import type { DiffFile } from "./diffPack.js";
 import type { Env } from "./types.js";
 
 function normalizePrivateKey(pem: string): string {
@@ -68,33 +69,34 @@ export async function postComment(
   });
 }
 
-export interface PullDiff {
+export interface PullContext {
   title: string;
   body: string;
   author: string;
-  diff: string;
-  truncated: boolean;
+  files: DiffFile[];
+  /** True when pagination stopped early (~300 files). */
+  filesIncomplete: boolean;
 }
 
 /**
- * Load PR metadata + unified patches, truncated to MAX_DIFF_CHARS.
+ * Load PR metadata + changed file patches (unbounded list; packing happens per provider).
  */
-export async function fetchPullDiff(
+export async function fetchPullContext(
   octokit: Octokit,
   owner: string,
   repo: string,
   pullNumber: number,
-  maxDiffChars: number,
-): Promise<PullDiff> {
+): Promise<PullContext> {
   const { data: pr } = await octokit.rest.pulls.get({
     owner,
     repo,
     pull_number: pullNumber,
   });
 
-  const files: Array<{ filename: string; status: string; patch?: string | null }> = [];
+  const files: DiffFile[] = [];
   const perPage = 100;
   let page = 1;
+  let filesIncomplete = false;
 
   for (;;) {
     const { data } = await octokit.rest.pulls.listFiles({
@@ -104,44 +106,30 @@ export async function fetchPullDiff(
       per_page: perPage,
       page,
     });
-    files.push(...data);
+    for (const f of data) {
+      files.push({
+        filename: f.filename,
+        status: f.status,
+        patch: f.patch,
+      });
+    }
     if (data.length < perPage) break;
     page += 1;
-    // Safety: huge PRs — stop paginating after ~300 files; truncation note covers the rest.
-    if (page > 3) break;
-  }
-
-  const chunks: string[] = [];
-  let used = 0;
-  let truncated = page > 3;
-
-  for (const file of files) {
-    const header = `--- ${file.filename} (${file.status})\n`;
-    const patch = file.patch ? `${file.patch}\n` : "(binary or too large to include patch)\n";
-    const block = header + patch;
-
-    if (used + block.length > maxDiffChars) {
-      const remaining = maxDiffChars - used;
-      if (remaining > 200) {
-        chunks.push(block.slice(0, remaining) + "\n… [truncated]\n");
-      }
-      truncated = true;
+    // Safety: huge PRs — stop paginating after ~300 files.
+    if (page > 3) {
+      filesIncomplete = true;
       break;
     }
-
-    chunks.push(block);
-    used += block.length;
-  }
-
-  if (files.length === 0) {
-    chunks.push("(no file patches available)");
   }
 
   return {
     title: pr.title || "(untitled)",
     body: pr.body || "",
     author: pr.user?.login || "unknown",
-    diff: chunks.join("\n"),
-    truncated,
+    files,
+    filesIncomplete,
   };
 }
+
+/** @deprecated Use fetchPullContext */
+export const fetchPullDiff = fetchPullContext;

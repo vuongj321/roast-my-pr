@@ -15,8 +15,11 @@ preview_id = "c431bd763676408ba1d9a70bd903f5f1"
 
 [vars]
 GEMINI_MODEL = "gemini-3.6-flash"
+GROQ_MODEL = "openai/gpt-oss-20b"
+OPENROUTER_MODEL = "openrouter/free"
 DAILY_ROAST_LIMIT = "20"
-MAX_DIFF_CHARS = "80000"
+# Global ceiling applied on top of per-provider budgets (see src/diffPack.ts).
+MAX_DIFF_CHARS = "48000"
 
 [observability]
 enabled = true

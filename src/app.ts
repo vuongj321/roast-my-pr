@@ -2,7 +2,7 @@ import type { Env } from "./types.js";
 import { isPullRequestComment, parseCommand } from "./command.js";
 import {
   createAppOctokit,
-  fetchPullDiff,
+  fetchPullContext,
   formatGithubError,
   postComment,
 } from "./github.js";
@@ -14,7 +14,7 @@ import {
   RATE_LIMIT_COMMENT,
 } from "./prompts.js";
 import { consumeRoastSlot } from "./rateLimit.js";
-import { GeminiQuotaError, generateRoast } from "./roast.js";
+import { RoastQuotaError, generateRoast } from "./roast.js";
 
 interface IssueCommentPayload {
   action?: string;
@@ -39,10 +39,6 @@ interface IssueCommentPayload {
     login?: string;
     type?: string;
   };
-}
-
-function maxDiffChars(env: Env): number {
-  return Math.max(5_000, Number.parseInt(env.MAX_DIFF_CHARS || "80000", 10) || 80_000);
 }
 
 /**
@@ -89,13 +85,7 @@ export async function handleIssueComment(
   await postComment(octokit, owner, repo, number, ACK_COMMENT);
 
   try {
-    const pull = await fetchPullDiff(
-      octokit,
-      owner,
-      repo,
-      number,
-      maxDiffChars(env),
-    );
+    const pull = await fetchPullContext(octokit, owner, repo, number);
 
     const roast = await generateRoast(env, {
       owner,
@@ -104,8 +94,8 @@ export async function handleIssueComment(
       title: pull.title,
       body: pull.body,
       author: pull.author,
-      diff: pull.diff,
-      truncated: pull.truncated,
+      files: pull.files,
+      filesIncomplete: pull.filesIncomplete,
     });
 
     const footer =
@@ -113,7 +103,7 @@ export async function handleIssueComment(
     await postComment(octokit, owner, repo, number, `${roast}${footer}`);
   } catch (err) {
     console.error("Roast failed", formatGithubError(err));
-    if (err instanceof GeminiQuotaError) {
+    if (err instanceof RoastQuotaError) {
       await postComment(octokit, owner, repo, number, QUOTA_COMMENT);
       return;
     }

@@ -2,7 +2,7 @@
   "name": "roast-my-pr",
   "version": "1.0.0",
   "private": true,
-  "description": "Self-hosted GitHub App that roasts PRs on /roastmypr using Gemini free tier",
+  "description": "Self-hosted GitHub App that roasts PRs on /roastmypr using free-tier LLMs (Gemini, Groq, OpenRouter)",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

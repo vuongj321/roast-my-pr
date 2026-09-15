@@ -1,5 +1,5 @@
 /**
- * Roast personality and output format for Gemini.
+ * Roast personality and output format for the LLM providers.
  */
 export const ROAST_SYSTEM_PROMPT = `You are "Roast my PR", a savage-but-helpful code reviewer bot on GitHub.
 
@@ -34,10 +34,17 @@ export function buildUserPrompt(input: {
   author: string;
   diff: string;
   truncated: boolean;
+  includedFiles?: number;
+  totalFiles?: number;
 }): string {
   const body = input.body?.trim() ? input.body.trim() : "(no description)";
+  const coverage =
+    typeof input.includedFiles === "number" &&
+    typeof input.totalFiles === "number"
+      ? `\nFiles in detailed diff: ${input.includedFiles} of ${input.totalFiles} changed`
+      : "";
   const truncationNote = input.truncated
-    ? "\n\nNOTE: The diff was truncated to fit model limits. Call out that the review may be incomplete."
+    ? "\n\nNOTE: The diff was packed/truncated to fit model limits (noisy files may be omitted). Call out that the review may be incomplete."
     : "";
 
   return `Roast this pull request.
@@ -45,7 +52,7 @@ export function buildUserPrompt(input: {
 Repository: ${input.owner}/${input.repo}
 PR #${input.number}
 Author: @${input.author}
-Title: ${input.title}
+Title: ${input.title}${coverage}
 
 Description:
 ${body}
@@ -67,8 +74,8 @@ Comment one of these on a pull request (first line of the comment):
 
 **Notes**
 - Only works on pull requests in repos where this GitHub App is installed.
-- Uses a free-tier model; if the free tier is exhausted you will get a retry-later message.
-- Large PRs may be truncated so the roast focuses on part of the diff.`;
+- Uses free-tier models (with failover); if all are exhausted you will get a retry-later message.
+- Large PRs are packed: lockfiles/assets skipped, source prioritized, remainder listed as omitted.`;
 
 export const ACK_COMMENT =
   "🔥 Firing up the flamethrower… fetching the diff and sharpening the jokes.";
@@ -77,7 +84,7 @@ export const RATE_LIMIT_COMMENT =
   "🧯 Easy there, pyro. This installation hit today's free-tier roast cap. Try again tomorrow (or raise `DAILY_ROAST_LIMIT` if you self-host).";
 
 export const QUOTA_COMMENT =
-  "😴 The free-tier model is napping (rate limit / quota). Try again in a bit.";
+  "😴 All free-tier models are napping (rate limit / quota). Try again in a bit.";
 
 export const ERROR_COMMENT =
   "💥 The flamethrower jammed. Check the Worker logs — something went wrong while roasting.";
