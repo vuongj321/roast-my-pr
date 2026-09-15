@@ -5,7 +5,8 @@
  * - drop noisy / generated files
  * - prefer source over lockfiles and assets
  * - cap each file and the total
- * - keep an inventory of what was omitted
+ * - clip by *hunk* (not by tail of patch), so fixes deep in a file survive
+ * - keep an inventory of what was omitted and what was only partially shown
  */
 
 export type DiffFile = {
@@ -23,6 +24,15 @@ export type PackOptions = {
   maxBodyChars: number;
 };
 
+/** A file whose patch only partly fitted the budget. */
+export type PartialFile = {
+  filename: string;
+  shownChars: number;
+  totalChars: number;
+  hunksShown: number;
+  hunksTotal: number;
+};
+
 export type PackedContext = {
   body: string;
   diff: string;
@@ -32,6 +42,21 @@ export type PackedContext = {
   includedFilenames: string[];
   totalFiles: number;
   omitted: Array<{ filename: string; reason: string }>;
+  /** Files shown with hunks dropped — absence of code there proves nothing. */
+  partialFiles: PartialFile[];
+  /** Patch characters shown to the model (coverage signal for the footer). */
+  shownPatchChars: number;
+  /** Patch characters across all reviewable (non-noise) files. */
+  totalPatchChars: number;
+};
+
+/** One `@@` hunk of a file patch (or the whole patch when it has no headers). */
+export type Hunk = {
+  text: string;
+  /** Added-line count; added code is where fixes live, so it ranks highest. */
+  added: number;
+  /** Position in the original patch, 0-based. */
+  index: number;
 };
 
 const SKIP_BASENAME =
@@ -131,45 +156,185 @@ export function matchesPriorityPath(
   return false;
 }
 
-function truncatePatch(
-  patch: string,
-  maxChars: number,
-): { text: string; clipped: boolean } {
-  if (patch.length <= maxChars) return { text: patch, clipped: false };
+/** True for lines a patch adds (excludes the `+++` file header). */
+function isAddedLine(line: string): boolean {
+  return line.startsWith("+") && !line.startsWith("+++");
+}
+
+/**
+ * Split a patch into hunk blocks. Patches without `@@` headers (GitHub clips
+ * very large patches) come back as one opaque block.
+ */
+export function splitPatchHunks(patch: string): Hunk[] {
+  const hunks: Hunk[] = [];
+  let buffer: string[] = [];
+  let started = false;
+
+  const flush = () => {
+    if (!started || buffer.length === 0) return;
+    hunks.push({
+      text: buffer.join("\n"),
+      added: buffer.filter(isAddedLine).length,
+      index: hunks.length,
+    });
+    buffer = [];
+  };
+
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("@@ ")) {
+      flush();
+      started = true;
+    }
+    if (started) buffer.push(line);
+  }
+  flush();
+
+  if (hunks.length > 0) return hunks;
+  const lines = patch.split("\n");
+  return [{ text: patch, added: lines.filter(isAddedLine).length, index: 0 }];
+}
+
+type HunkSelection = {
+  text: string;
+  hunksShown: number;
+  hunksTotal: number;
+  /** Hunk numbers (1-based) that made it into the pack. */
+  shownNumbers: number[];
+  clipped: boolean;
+};
+
+/**
+ * Keep the highest-signal hunks inside `maxChars`. Added-code density wins:
+ * new functions, transactions and validation live in added lines, and slicing
+ * the tail of a patch dropped exactly those.
+ */
+export function selectPatchHunks(patch: string, maxChars: number): HunkSelection {
+  const hunks = splitPatchHunks(patch);
+  if (patch.length <= maxChars) {
+    return {
+      text: patch,
+      hunksShown: hunks.length,
+      hunksTotal: hunks.length,
+      shownNumbers: hunks.map((h) => h.index + 1),
+      clipped: false,
+    };
+  }
+
+  const gap = (count: number) =>
+    `… [${count} hunk${count === 1 ? "" : "s"} not shown]`;
+  const ranked = [...hunks].sort(
+    (a, b) => b.added - a.added || a.index - b.index,
+  );
+  const chosen = new Set<number>();
+  let used = 0;
+
+  for (const hunk of ranked) {
+    const cost = hunk.text.length + 1;
+    if (used + cost > maxChars && chosen.size > 0) continue;
+    chosen.add(hunk.index);
+    used += cost;
+    if (used >= maxChars) break;
+  }
+  if (chosen.size === 0) chosen.add(ranked[0]!.index);
+
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const hunk of hunks) {
+    if (!chosen.has(hunk.index)) continue;
+    if (hunk.index > cursor) parts.push(gap(hunk.index - cursor));
+    parts.push(hunk.text);
+    cursor = hunk.index + 1;
+  }
+  if (cursor < hunks.length) parts.push(gap(hunks.length - cursor));
+
+  let text = parts.join("\n");
+  // A single hunk can still be larger than the whole per-file budget.
+  if (text.length > maxChars) {
+    text = `${text.slice(0, Math.max(0, maxChars - 20))}\n… [file truncated]\n`;
+  }
+
   return {
-    text: `${patch.slice(0, Math.max(0, maxChars - 20))}\n… [file truncated]\n`,
+    text,
+    hunksShown: chosen.size,
+    hunksTotal: hunks.length,
+    shownNumbers: [...chosen].sort((a, b) => a - b).map((i) => i + 1),
     clipped: true,
   };
 }
 
+type FileBlock = {
+  filename: string;
+  block: string;
+  shownChars: number;
+  totalChars: number;
+  hunksShown: number;
+  hunksTotal: number;
+  clipped: boolean;
+};
+
 function formatFileBlock(
   file: DiffFile,
   maxPerFileChars: number,
-): { block: string; clipped: boolean } {
-  const header = `--- ${file.filename} (${file.status})\n`;
+): FileBlock {
   if (!file.patch) {
     return {
-      block: `${header}(binary or too large for GitHub patch API)\n`,
+      filename: file.filename,
+      block: `--- ${file.filename} (${file.status})\n(binary or too large for GitHub patch API)\n`,
+      shownChars: 0,
+      totalChars: 0,
+      hunksShown: 0,
+      hunksTotal: 0,
       clipped: false,
     };
   }
-  const { text, clipped } = truncatePatch(file.patch, maxPerFileChars);
-  return { block: `${header}${text}\n`, clipped };
+
+  const selection = selectPatchHunks(file.patch, maxPerFileChars);
+  const annotation = selection.clipped
+    ? ` [partial: ${selection.hunksShown} of ${selection.hunksTotal} hunks]`
+    : "";
+  return {
+    filename: file.filename,
+    block: `--- ${file.filename} (${file.status})${annotation}\n${selection.text}\n`,
+    shownChars: Math.min(selection.text.length, file.patch.length),
+    totalChars: file.patch.length,
+    hunksShown: selection.hunksShown,
+    hunksTotal: selection.hunksTotal,
+    clipped: selection.clipped,
+  };
 }
 
 function buildInventory(
   omitted: Array<{ filename: string; reason: string }>,
+  partial: PartialFile[],
 ): string {
-  if (omitted.length === 0) return "";
-  const lines = omitted
-    .slice(0, 40)
-    .map((o) => `- ${o.filename} (${o.reason})`)
-    .join("\n");
-  const extra =
-    omitted.length > 40
-      ? `\n- …and ${omitted.length - 40} more omitted files`
-      : "";
-  return `\n\nOmitted from detailed review:\n${lines}${extra}`;
+  const sections: string[] = [];
+
+  if (partial.length > 0) {
+    sections.push(
+      [
+        "Partially shown files (hunks were dropped to fit the budget — code you cannot see here is NOT proof that it is missing):",
+        ...partial
+          .slice(0, 20)
+          .map(
+            (p) =>
+              `- ${p.filename} (${p.hunksShown} of ${p.hunksTotal} hunks, ${p.shownChars} of ${p.totalChars} chars)`,
+          ),
+      ].join("\n"),
+    );
+  }
+
+  if (omitted.length > 0) {
+    const lines = omitted
+      .slice(0, 40)
+      .map((o) => `- ${o.filename} (${o.reason})`);
+    if (omitted.length > 40) {
+      lines.push(`- …and ${omitted.length - 40} more omitted files`);
+    }
+    sections.push(["Omitted from detailed review:", ...lines].join("\n"));
+  }
+
+  if (sections.length === 0) return "";
+  return `\n\n${sections.join("\n\n")}`;
 }
 
 /**
@@ -196,9 +361,12 @@ export function packPullContext(
   }
 
   const omitted: Array<{ filename: string; reason: string }> = [];
+  const partialFiles: PartialFile[] = [];
   const included = new Set<string>();
   const chunks: string[] = [];
   let used = 0;
+  let shownPatchChars = 0;
+  let totalPatchChars = 0;
 
   const ranked = files
     .map((file, index) => ({
@@ -210,6 +378,21 @@ export function packPullContext(
     }))
     .sort((a, b) => a.priority - b.priority || a.index - b.index);
 
+  const recordCoverage = (block: FileBlock) => {
+    used += block.block.length;
+    shownPatchChars += block.shownChars;
+    totalPatchChars += block.totalChars;
+    if (block.clipped && block.totalChars > 0) {
+      partialFiles.push({
+        filename: block.filename,
+        shownChars: block.shownChars,
+        totalChars: block.totalChars,
+        hunksShown: block.hunksShown,
+        hunksTotal: block.hunksTotal,
+      });
+    }
+  };
+
   for (const { file } of ranked) {
     if (isNoiseFile(file.filename)) {
       omitted.push({
@@ -220,25 +403,23 @@ export function packPullContext(
       continue;
     }
 
-    const { block, clipped } = formatFileBlock(file, maxPerFile);
-    if (clipped) truncated = true;
+    let block = formatFileBlock(file, maxPerFile);
 
-    if (used + block.length > maxTotal) {
+    if (used + block.block.length > maxTotal) {
       const remaining = maxTotal - used;
-      if (remaining > 240 && !included.has(file.filename)) {
-        chunks.push(`${block.slice(0, remaining)}\n… [truncated]\n`);
-        included.add(file.filename);
-        used = maxTotal;
-      } else {
+      if (remaining < 400 || included.has(file.filename)) {
         omitted.push({ filename: file.filename, reason: "over total budget" });
+        truncated = true;
+        continue;
       }
-      truncated = true;
-      continue;
+      // Last file that fits: keep its best hunks instead of a mid-line slice.
+      block = formatFileBlock(file, remaining - 80);
     }
 
-    chunks.push(block);
-    used += block.length;
+    if (block.clipped) truncated = true;
+    chunks.push(block.block);
     included.add(file.filename);
+    recordCoverage(block);
   }
 
   // Any source file we never marked included/omitted (shouldn't happen) — belt and suspenders.
@@ -267,12 +448,15 @@ export function packPullContext(
 
   return {
     body: packedBody,
-    diff: `${chunks.join("\n")}${buildInventory(omitted)}`,
-    truncated: truncated || omitted.length > 0,
+    diff: `${chunks.join("\n")}${buildInventory(omitted, partialFiles)}`,
+    truncated: truncated || omitted.length > 0 || partialFiles.length > 0,
     includedFiles: included.size,
     includedFilenames: [...included],
     totalFiles: files.length,
     omitted,
+    partialFiles,
+    shownPatchChars,
+    totalPatchChars,
   };
 }
 
