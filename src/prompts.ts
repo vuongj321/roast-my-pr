@@ -78,22 +78,6 @@ ${input.diff}
 ${truncationNote}`;
 }
 
-export const HELP_COMMENT = `### Roast my PR
-
-Comment one of these on a pull request (first line of the comment):
-
-- \`/roastmypr\` — full review
-- \`/roast\` — same thing
-- \`/roastmypr help\` — this message
-
-**Notes**
-- Only works on pull requests in repos where this GitHub App is installed.
-- Uses free-tier models (with failover); if all are exhausted you will get a retry-later message.
-- Large PRs are packed: lockfiles/assets skipped, source prioritized, remainder listed as omitted.`;
-
-export const ACK_COMMENT =
-  "Reading the diff. Reviewing the PR...";
-
 export const RATE_LIMIT_COMMENT =
   "You're done for today. This installation hit the free-tier cap. Try again tomorrow (or raise \`DAILY_ROAST_LIMIT\` if you self-host).";
 

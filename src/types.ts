@@ -14,6 +14,6 @@ export interface Env {
 }
 
 export interface RoastCommand {
-  kind: "roast" | "help";
+  kind: "roast";
   raw: string;
 }

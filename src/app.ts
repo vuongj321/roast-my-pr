@@ -7,9 +7,7 @@ import {
   postComment,
 } from "./github.js";
 import {
-  ACK_COMMENT,
   ERROR_COMMENT,
-  HELP_COMMENT,
   QUOTA_COMMENT,
   RATE_LIMIT_COMMENT,
 } from "./prompts.js";
@@ -71,18 +69,11 @@ export async function handleIssueComment(
 
   const octokit = createAppOctokit(env, installationId);
 
-  if (command.kind === "help") {
-    await postComment(octokit, owner, repo, number, HELP_COMMENT);
-    return;
-  }
-
   const slot = await consumeRoastSlot(env, installationId);
   if (!slot.allowed) {
     await postComment(octokit, owner, repo, number, RATE_LIMIT_COMMENT);
     return;
   }
-
-  await postComment(octokit, owner, repo, number, ACK_COMMENT);
 
   try {
     const pull = await fetchPullContext(octokit, owner, repo, number);

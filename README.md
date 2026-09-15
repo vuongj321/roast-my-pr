@@ -14,12 +14,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deep dive.
 
 ## Commands
 
-| Comment (first line) | Effect |
-| --- | --- |
-| `/roastmypr` | Full roast review |
-| `/roast` | Same |
-| `/roast my pr` | Same |
-| `/roastmypr help` | Usage text |
+Comment `/roastmypr` as the first line of a PR comment to get a full roast review.
 
 ## Quick start (self-host)
 
