@@ -8,9 +8,20 @@ Runs on **Cloudflare Workers** (free tier) with free-tier LLMs: **Google Gemini*
 
 1. You comment `/roastmypr` on a PR (first line of the comment).
 2. GitHub sends an `issue_comment` webhook to your Worker.
-3. The Worker verifies the signature, loads the PR diff, calls Gemini (falling back to Groq then Workers AI on capacity/quota errors), and posts the result.
+3. The Worker verifies the signature, loads the PR diff, and reads the review state left by the previous roast (reviewed SHA + findings).
+4. It calls Gemini (falling back to Groq then Workers AI on capacity/quota errors) and posts the roast. The footer carries fresh state, so the next roast knows what it already said.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deep dive.
+
+### Repeat roasts
+
+The bot keeps memory of its own review in the comment footer (an invisible HTML comment), so re-running it after you push fixes does not re-raise what you already fixed:
+
+- Each roast records the **reviewed commit SHA** plus its findings as `F1..Fn`.
+- On the next run the Worker asks GitHub's compare API for **what changed since that SHA** and tells the model those changes are the author's fixes. The model must answer every finding `resolved`, `still present — "<quote>"`, or `unverifiable` (it is told to say "unverifiable" rather than repeat something it cannot see).
+- Bullets that contradict that accounting — re-raising something the model itself marked resolved — are dropped before posting.
+- Files are packed **by hunk**, not by truncating the tail of a patch, and clipped files are named to the model as partially shown.
+- If a run only covers a fraction of the PR (typical on the Groq fallback), the comment starts with `Partial review: only N of M changed files…` instead of pretending it saw everything.
 
 ## Commands
 
@@ -89,7 +100,7 @@ Optional vars in `wrangler.toml` (not secret):
 
 Failover order: **Gemini → Groq → Workers AI**. Groq is skipped if its API key is unset; Workers AI runs when the `AI` binding is present.
 
-Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized, and each provider gets a budget that fits its free-tier limits. If a provider rejects the prompt as too large or returns an empty completion, the Worker shrinks the pack and retries once.
+Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized, and each provider gets a budget that fits its free-tier limits. Within a file the packer keeps the **added-code-dense hunks** (the ones where fixes live) and marks the file `[partial: 3 of 8 hunks]`, so a 12 KB file no longer loses its last functions to a tail truncation. If a provider rejects the prompt as too large or returns an empty completion, the Worker shrinks the pack and retries once. The "changes since your last review" diff is carved out of the same budget, so review memory never inflates the prompt.
 
 ### 5. Run locally
 
@@ -126,13 +137,13 @@ src/
   app.ts             issue_comment orchestration
   command.ts         /roastmypr parsing
   github.ts          App auth, PR context fetch, comments
-  diffPack.ts        Noise filtering + per-provider diff budgets
-  pathFilter.ts      Strip bullets citing paths outside packed set
+  diffPack.ts        Noise filtering + hunk-level packing + per-provider budgets
+  pathFilter.ts      Path filter, F1/F2 accounting, resolved-repeat removal
   roast.ts           LLM client (Gemini → Groq → Workers AI)
   responseText.ts    Normalize / extract usable model completions
-  prompts.ts         Roast personality
+  prompts.ts         Roast personality, review state, coverage warnings
   rateLimit.ts       KV daily caps
-  types.ts           Env and command types
+  types.ts           Env, command, finding and review-state types
 docs/
   ARCHITECTURE.md
   GITHUB_APP_SETUP.md

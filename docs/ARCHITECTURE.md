@@ -134,12 +134,13 @@ sequenceDiagram
     Worker->>GitHub: Comment free tier limit message
   else Under cap
     Worker->>GitHub: Fetch PR files and patches as installation
-    Worker->>GitHub: Fetch latest prior roast comment if any
-    Worker->>Worker: Pack diff (boost prior-cited paths; provider budget)
-    Worker->>LLM: Gemini then Groq then Workers AI (prior roast as hypotheses)
-    LLM-->>Worker: Roast markdown
-    Worker->>Worker: Strip bullets citing paths outside packed set
-    Worker->>GitHub: Post roast comment on PR
+    Worker->>GitHub: Fetch latest prior roast comment with its review state
+    Worker->>GitHub: If state SHA is older, fetch the compare delta
+    Worker->>Worker: Pack diff by hunk (boost prior-cited paths; provider budget)
+    Worker->>LLM: Gemini then Groq then Workers AI (findings + delta + diff)
+    LLM-->>Worker: Roast markdown plus F1/F2 accounting lines
+    Worker->>Worker: Drop unpacked-path bullets and self-contradicting repeats
+    Worker->>GitHub: Post roast comment whose footer carries the new review state
   end
   Worker-->>GitHub: HTTP 200
 ```
@@ -161,13 +162,18 @@ sequenceDiagram
 
 6. **Rate limit** — Check and increment the daily roast counter in KV. If over the cap, post a limit message and stop.
 
-7. **Context load** — Fetch PR title, body, changed files, and patches. Also load the latest prior Roast my PR comment on the thread (footer-marked), if any. Paths cited there are prioritized when packing so re-roasts can actually verify old findings. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
+7. **Context load** — Fetch PR title, body, changed files, patches, and the head SHA. Then load the latest prior Roast my PR comment (footer-marked) and read the machine-readable **review state** hidden in its footer: the SHA that was reviewed plus addressable findings (`F1`, `F2`, …). When that SHA differs from the current head, ask the compare API for what was pushed since — that delta is the only input which actually distinguishes "still broken" from "not shown to you". Roasts posted before review state existed carry none, so findings are derived from their bullets instead. Paths cited there are prioritized when packing so re-roasts can verify old findings. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
 
-8. **Roast generation** — For each provider (Gemini → Groq → Workers AI): pack the file list into that provider’s character budget, attach a truncated prior roast (if any) as claims to re-verify, call the API/binding, and on “request too large” (or empty completion for non-Groq providers) shrink 50% and retry once. Groq requests set `include_reasoning: false` / `reasoning_effort: low` so answers land in `content`. Response parsing prefers `content`/`response`; `reasoning` is only accepted when it looks like a finished roast. Then apply a **light path filter**: drop bullets that cite file paths not included in the packed set. Always post a non-empty model reply after that filter (do not fail the provider when bullets are stripped). Skip Groq if its key is unset; skip Workers AI if the `AI` binding is missing.
+8. **Roast generation** — For each provider (Gemini → Groq → Workers AI): pack the file list into that provider’s character budget, call the API/binding, and on “request too large” (or empty completion for non-Groq providers) shrink 50% and retry once. Groq requests set `include_reasoning: false` / `reasoning_effort: low` so answers land in `content`. Response parsing prefers `content`/`response`; `reasoning` is only accepted when it looks like a finished roast. What the prompt contains matters as much as the budget:
+   - **Files are packed by hunk, not by tail.** A file whose patch exceeds the per-file cap keeps its *added-code-dense* hunks and drops the rest, with `[partial: 3 of 8 hunks]` on the header and `… [n hunks not shown]` gap markers. Truncating from the top of a patch is what hid transaction wrappers and validation written at the bottom of a 12 KB file.
+   - **Partial coverage is stated, not implied.** Every clipped file is listed under “Partially shown files”, and the system prompt forbids claiming code is missing when it may simply be outside what was shown.
+   - **The review delta is carved out of the same budget** (30%), so adding a delta never pushes a free-tier prompt past its limit.
+   - **Prior findings must be accounted for**: the model emits one `- F1 resolved` / `- F2 still present — "<quote>"` / `- F3 unverifiable` line per finding before the roast, and is told never to re-raise something it marked resolved.
+9. **Post-processing** — Strip the `F1/F2` accounting block, drop bullets that cite file paths not in the packed set, then drop bullets that contradict the accounting by re-raising a resolution the model itself declared. If the run covered less than half the changed files, prepend a visible `Partial review: only N of M changed files…` banner.
 
-9. **Final comment** — Post one markdown comment on the PR (v1 does not create inline review threads on specific lines).
+10. **Final comment** — Post one markdown comment on the PR (v1 does not create inline review threads on specific lines). Its footer carries the reviewed SHA plus the findings parsed from this roast, so the *next* run has state instead of prose to reconcile against.
 
-10. **HTTP response** — Return success to GitHub. Webhook handlers should acknowledge promptly; heavy work still happens in the same invocation for MVP (Workers have CPU/time limits—keep prompts and diffs bounded).
+11. **HTTP response** — Return success to GitHub. Webhook handlers should acknowledge promptly; heavy work still happens in the same invocation for MVP (Workers have CPU/time limits—keep prompts and diffs bounded).
 
 ## 5. Code layout (intended modules)
 
@@ -179,14 +185,14 @@ roast-my-pr/
     index.ts                 # HTTP entry: route + signature verify + dispatch
     app.ts                   # issue_comment handling and /roastmypr routing
     command.ts               # Parse first-line /roastmypr
-    github.ts                # App JWT, installation Octokit, PR context, comments
-    diffPack.ts              # Noise filtering + per-provider diff budgets
-    pathFilter.ts            # Strip bullets citing paths outside packed set
+    github.ts                # App JWT, installation Octokit, PR context, compare delta, comments
+    diffPack.ts              # Noise filtering, hunk-level packing, per-provider budgets
+    pathFilter.ts            # Path filter, F1/F2 accounting, resolved-repeat removal
     roast.ts                 # LLM client with Gemini → Groq → Workers AI failover
     responseText.ts          # Normalize / extract usable model completions
-    prompts.ts               # Roast personality and output format
+    prompts.ts               # Roast personality, review state, coverage warnings
     rateLimit.ts             # KV daily caps
-    types.ts                 # Env and command types
+    types.ts                 # Env, command, finding and review-state types
   docs/
     ARCHITECTURE.md          # This file
   README.md                  # Self-host setup guide
@@ -195,16 +201,30 @@ roast-my-pr/
 | Module | Responsibility |
 | --- | --- |
 | `index.ts` | Cloudflare `fetch` handler; webhook path; signature check; JSON parse |
-| `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, roast, and reply |
+| `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, review state, delta, roast, reply |
 | `command.ts` | Parse the first line of a comment for `/roastmypr` |
-| `github.ts` | All GitHub API interaction through Octokit (including prior roast lookup) |
-| `diffPack.ts` | Skip noisy files, prioritize source / prior-cited paths, pack patches to a budget |
-| `pathFilter.ts` | Drop roast bullets that cite file paths not in the packed set |
-| `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover, path filter |
+| `github.ts` | All GitHub API interaction through Octokit (prior roast lookup with state, compare delta, comments) |
+| `diffPack.ts` | Skip noisy files, prioritize source / prior-cited paths, pack patches by hunk to a budget, report partial coverage |
+| `pathFilter.ts` | Drop bullets citing unpacked paths; strip the `F1/F2` accounting; drop bullets that re-raise a resolved finding |
+| `roast.ts` | Multi-provider LLM request/response, per-provider packing, delta budget, failover, post-processing |
 | `responseText.ts` | Turn provider JSON into plain roast text; prefer `content` over unfinished reasoning |
-| `prompts.ts` | Prompt text kept separate so tone can be tuned without touching I/O |
+| `prompts.ts` | Prompt text, footer/state round-trip, finding parsing, partial-coverage banner |
 | `rateLimit.ts` | Read/increment KV counters (`RATE_LIMIT` binding required) |
-| `types.ts` | Shared `Env` and `RoastCommand` types |
+| `types.ts` | Shared `Env`, `RoastCommand`, `PriorFinding`, `RoastState`, `PackCoverage` types |
+
+### 4.1 Review memory (why a re-roast does not repeat a fixed item)
+
+Prose reviews cannot answer "did the author fix F2?" on a later run — the next model sees a *cumulative* base…head diff and a wall of prior text, so anything the packer clipped reads as "still missing". Three pieces of state close that gap:
+
+| Piece | Where it lives | What it buys |
+| --- | --- | --- |
+| Reviewed SHA | HTML comment in the roast footer (`<!-- roastmypr-state … -->`), invisible when rendered | Lets the next run ask GitHub exactly what changed |
+| Findings `F1..Fn` | Same footer, parsed from the roast’s bullets | Gives the next model a checklist to answer, not a vibe to match |
+| Delta diff | `repos.compareCommitsWithBasehead(reviewedSha…head)` | Proof that the fix exists, which is what the model actually needed |
+
+The next run then requires one accounting line per finding (`resolved` / `still present — "<quote>"` / `unverifiable`) and enforces it: bullets that contradict a declared resolution are removed, and findings the run could not see must be marked `unverifiable` rather than re-raised. Because the delta consumes 30% of the provider budget, adding memory does not increase prompt size.
+
+Known limits: state travels inside the comment, so a deleted roast comment loses memory (the run degrades to bullet-derived findings); a force-push makes `compare` fail and the run continues without a delta; and coverage on the Groq fallback is still thin, which is why partial runs are labelled instead of trusted.
 
 **Octokit** is the TypeScript client for GitHub’s REST API. We use it directly (plus app-auth helpers) instead of the full **Probot** framework, because Probot assumes a more traditional Node server while Workers use a `fetch` handler model.
 
@@ -292,6 +312,10 @@ They do **not** install your App onto their account when the App is **Only on th
 | Bot-authored comment | Ignore (prevent loops) |
 | Command without install / missing permission | Error comment or logged failure; no crash loop |
 | Diff too large | Truncate; note in roast that review is partial |
+| Provider budget covers less than half the PR | Roast is prefixed `Partial review: only N of M changed files…`; clipped files are named to the model |
+| Author pushes fixes, then re-runs the bot | Compare delta injected as "changes pushed since that review"; every finding must be answered `resolved` / `still present` / `unverifiable` |
+| Reviewed SHA is gone (force-push/rebase) | Compare fails; the run continues without a delta and unseen findings become `unverifiable` |
+| Model re-raises something it marked resolved | Bullet is dropped by the repeat filter before posting |
 | All configured LLMs rate-limited / quota | User-visible “try later” comment |
 | KV daily cap exceeded | User-visible limit comment; no LLM call |
 
