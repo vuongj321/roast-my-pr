@@ -5,6 +5,8 @@ WEBHOOK_SECRET=replace-with-your-webhook-secret
 # PKCS#8 PEM; use \n for newlines if stored on one line, or a real multiline value in .dev.vars
 PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 GEMINI_API_KEY=your-google-ai-studio-key
-# Optional free-tier fallbacks (skip a provider by leaving its key unset)
+# Optional free-tier Groq fallback (skip by leaving unset)
 GROQ_API_KEY=
-OPENROUTER_API_KEY=
+# Workers AI uses the wrangler `[ai]` binding (no API key). Optional: delete stale
+# OPENROUTER_API_KEY from Cloudflare if you previously set it:
+#   npx wrangler secret delete OPENROUTER_API_KEY

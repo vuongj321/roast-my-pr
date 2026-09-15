@@ -16,7 +16,7 @@ It **is**:
 
 - A **self-hosted GitHub App** (account-only install)
 - Running on a **Cloudflare Worker** (serverless HTTP handler)
-- Powered by **free-tier LLMs** (Gemini primary, optional Groq / OpenRouter failover)
+- Powered by **free-tier LLMs** (Gemini primary, optional Groq, then Workers AI failover)
 - Meant to be **cloned** by anyone who wants their own copy, with their own App, Worker, and API key
 
 ## 2. High-level system diagram
@@ -32,31 +32,33 @@ flowchart LR
   subgraph cloudflare [Your Cloudflare account]
     Worker[Cloudflare Worker]
     KV[KV rate-limit store optional]
-    Secrets[Secrets APP_ID PRIVATE_KEY WEBHOOK_SECRET GEMINI_API_KEY optional GROQ OPENROUTER]
+    AIBind[Workers AI binding]
+    Secrets[Secrets APP_ID PRIVATE_KEY WEBHOOK_SECRET GEMINI_API_KEY optional GROQ]
   end
 
   subgraph models [Free-tier LLMs]
     Gemini[Gemini primary]
     Groq[Groq fallback]
-    OpenRouter[OpenRouter fallback]
+    WorkersAI[Workers AI failover]
   end
 
   User --> Repos
   Repos -->|issue_comment webhook| Worker
   AppReg -.->|identity and permissions| Worker
   Secrets --> Worker
+  AIBind --> Worker
   Worker -->|verify signature auth Octokit| Repos
   Worker --> KV
   Worker -->|diff plus roast prompt| Gemini
   Gemini -.->|on capacity or quota| Groq
-  Groq -.->|on capacity or quota| OpenRouter
+  Groq -.->|on capacity or quota| WorkersAI
   Gemini -->|roast text| Worker
   Groq -->|roast text| Worker
-  OpenRouter -->|roast text| Worker
+  WorkersAI -->|roast text| Worker
   Worker -->|post PR comment| Repos
 ```
 
-**One sentence:** GitHub notifies your Worker; the Worker proves the request is real, authenticates as your App, loads the PR diff, calls Gemini (with Groq/OpenRouter failover), and writes the roast back to the PR.
+**One sentence:** GitHub notifies your Worker; the Worker proves the request is real, authenticates as your App, loads the PR diff, calls Gemini (with Groq/Workers AI failover), and writes the roast back to the PR.
 
 ## 3. The four building blocks
 
@@ -91,23 +93,23 @@ Responsibilities of the Worker:
 4. Authenticate to the GitHub API as the App installation
 5. Fetch PR metadata and the diff
 6. Optionally check a daily rate limit in KV
-7. Call an LLM with the roast prompt (Gemini → Groq → OpenRouter)
+7. Call an LLM with the roast prompt (Gemini → Groq → Workers AI)
 8. Post the roast comment
 
 **Wrangler** is Cloudflare’s CLI used to develop (`wrangler dev`), set secrets, and deploy (`wrangler deploy`).
 
 ### 3.3 Free-tier LLMs (the brain)
 
-Google AI Studio issues a free-tier Gemini API key (required). Optional Groq and OpenRouter keys act as failover when Gemini hits capacity, rate limits, or other retryable errors.
+Google AI Studio issues a free-tier Gemini API key (required). Optional Groq acts as failover when Gemini hits capacity. **Workers AI** (via the Worker `AI` binding, no API key) is the final free-tier failover. Workers AI free plan includes **10,000 Neurons/day**.
 
 The Worker sends:
 
 - A **system prompt** (roast personality, rules, output shape)
 - A **user payload** (PR title, body, **packed** file patches)
 
-Packing is **provider-specific**. Gemini can take a larger diff than Groq’s free-tier TPM cap (~8k tokens/request). On failover we rebuild a smaller pack instead of resending the Gemini-sized prompt. Noisy files (lockfiles, images, `dist/`, etc.) are skipped and listed as omitted so the model still knows they changed.
+Packing is **provider-specific**. Gemini can take a larger diff; Groq’s free-tier **8K TPM** forces a tighter pack; Workers AI uses a moderate pack to preserve the daily neuron budget. On failover we rebuild a pack for that provider instead of resending the Gemini-sized prompt. Noisy files (lockfiles, images, `dist/`, etc.) are skipped and listed as omitted so the model still knows they changed. Paths cited in a prior roast are packed first. After the model replies, bullets without a verbatim `Evidence:` quote present in the packed diff are stripped.
 
-The first successful provider returns text; the Worker posts that text to GitHub. No model runs inside Cloudflare—Cloudflare only orchestrates.
+The first successful provider returns text; the Worker posts that text to GitHub. Gemini and Groq are external HTTP APIs; Workers AI runs through Cloudflare’s `env.AI` binding.
 
 ### 3.4 Optional Cloudflare KV (quota guardrail)
 
@@ -132,9 +134,11 @@ sequenceDiagram
     Worker->>GitHub: Comment free tier limit message
   else Under cap
     Worker->>GitHub: Fetch PR files and patches as installation
-    Worker->>Worker: Pack diff for provider budget (skip noise)
-    Worker->>LLM: Gemini then Groq then OpenRouter (repack each time)
+    Worker->>GitHub: Fetch latest prior roast comment if any
+    Worker->>Worker: Pack diff (boost prior-cited paths; provider budget)
+    Worker->>LLM: Gemini then Groq then Workers AI (prior roast as hypotheses)
     LLM-->>Worker: Roast markdown
+    Worker->>Worker: Strip bullets without Evidence in packed diff
     Worker->>GitHub: Post roast comment on PR
   end
   Worker-->>GitHub: HTTP 200
@@ -157,9 +161,9 @@ sequenceDiagram
 
 6. **Rate limit** — Check and increment the daily roast counter in KV. If over the cap, post a limit message and stop.
 
-7. **Context load** — Fetch PR title, body, changed files, and patches. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
+7. **Context load** — Fetch PR title, body, changed files, and patches. Also load the latest prior Roast my PR comment on the thread (footer-marked), if any. Paths cited there are prioritized when packing so re-roasts can actually verify old findings. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
 
-8. **Roast generation** — For each provider (Gemini → Groq → OpenRouter): pack the file list into that provider’s character budget, call the API, and on “request too large” shrink 50% and retry once. Skip providers without keys. Only when every configured provider fails with quota-like errors do we post a friendly “free tier is napping” comment.
+8. **Roast generation** — For each provider (Gemini → Groq → Workers AI): pack the file list into that provider’s character budget, attach a truncated prior roast (if any) as claims to re-verify, call the API/binding, and on “request too large” shrink 50% and retry once. Then **evidence-filter** the reply: keep only bullets whose `Evidence: \`...\`` quote appears in the packed diff. If a provider keeps zero bullets, treat that as a failure and try the next provider. If every attempt is quota/empty-evidence, post a short “try again when Gemini is free” note — never post an empty “no findings” fallback as if the PR were clean. Skip Groq if its key is unset; skip Workers AI if the `AI` binding is missing.
 
 9. **Final comment** — Post one markdown comment on the PR (v1 does not create inline review threads on specific lines).
 
@@ -176,7 +180,8 @@ roast-my-pr/
     app.ts                   # issue_comment handling and /roastmypr routing
     github.ts                # App JWT, installation Octokit, PR context, comments
     diffPack.ts              # Noise filtering + per-provider diff budgets
-    roast.ts                 # LLM client with Gemini → Groq → OpenRouter failover
+    evidenceFilter.ts        # Strip bullets without Evidence in packed diff
+    roast.ts                 # LLM client with Gemini → Groq → Workers AI failover
     prompts.ts               # Roast personality and output format
     rateLimit.ts             # Optional KV daily caps
   docs/
@@ -188,9 +193,10 @@ roast-my-pr/
 | --- | --- |
 | `index.ts` | Cloudflare `fetch` handler; webhook path; signature check; JSON parse |
 | `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, roast, and reply |
-| `github.ts` | All GitHub API interaction through Octokit |
-| `diffPack.ts` | Skip noisy files, prioritize source, pack patches to a budget |
-| `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover |
+| `github.ts` | All GitHub API interaction through Octokit (including prior roast lookup) |
+| `diffPack.ts` | Skip noisy files, prioritize source / prior-cited paths, pack patches to a budget |
+| `evidenceFilter.ts` | Drop roast bullets whose Evidence quotes are not in the packed diff |
+| `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover, evidence filter |
 | `prompts.ts` | Prompt text kept separate so tone can be tuned without touching I/O |
 | `rateLimit.ts` | Read/increment KV counters |
 
@@ -222,11 +228,12 @@ Secrets live in Cloudflare Worker secrets (or local `.dev.vars` for development)
 - `WEBHOOK_SECRET`
 - `GEMINI_API_KEY`
 - `GROQ_API_KEY` (optional failover)
-- `OPENROUTER_API_KEY` (optional failover)
+- Workers AI uses the wrangler `[ai]` binding (`env.AI`) — no secret. Override model with `WORKERS_AI_MODEL`.
+- If migrating from OpenRouter: `npx wrangler secret delete OPENROUTER_API_KEY`
 
 ### 6.4 Trust and privacy
 
-The Worker receives PR diffs for repos where the App is installed. For a self-hosted, account-only bot, that means **your** repos and **your** API keys. Diffs go to Gemini first; on failover they may also be sent to Groq and/or OpenRouter. Free-tier providers may use prompts/responses to improve products—document that for operators of a self-hosted copy.
+The Worker receives PR diffs for repos where the App is installed. For a self-hosted, account-only bot, that means **your** repos and **your** API keys. Diffs go to Gemini first; on failover they may also be sent to Groq and/or Workers AI. Free-tier providers may use prompts/responses to improve products—document that for operators of a self-hosted copy.
 
 ## 7. Local development vs production
 
@@ -235,7 +242,7 @@ The Worker receives PR diffs for repos where the App is installed. For a self-ho
 ```mermaid
 flowchart LR
   GitHub -->|HTTPS webhook| WorkerURL["worker.workers.dev"]
-  WorkerURL --> LLM[Gemini Groq OpenRouter]
+  WorkerURL --> LLM[Gemini Groq WorkersAI]
 ```
 
 Webhook URL on the GitHub App points at the deployed Worker.
@@ -248,7 +255,7 @@ GitHub cannot reach `localhost` directly. A relay such as **smee.io** provides a
 flowchart LR
   GitHub -->|webhook| Smee[smee.io public URL]
   Smee -->|forward| Local["wrangler dev on localhost"]
-  Local --> LLM[Gemini Groq OpenRouter]
+  Local --> LLM[Gemini Groq WorkersAI]
 ```
 
 Flow for a developer:
@@ -289,7 +296,7 @@ They do **not** install your App onto their account when the App is **Only on th
 - Auto-roast on every `pull_request` opened
 - Bring-your-own-key dashboards
 - GitHub Marketplace listing
-- Paid-only model fallbacks (Groq/OpenRouter free tiers only)
+- Paid-only model fallbacks (Groq free tier + Workers AI free Neurons only)
 
 ## 11. Mental model summary
 
@@ -297,7 +304,7 @@ Think of the system as three doors and one brain:
 
 1. **GitHub App door** — Who is allowed to act in which repos, and which events are sent  
 2. **Worker door** — Public HTTPS endpoint that only trusts signed GitHub traffic  
-3. **LLM brain** — Turns diff + roast instructions into the comment text (Gemini, with Groq/OpenRouter failover)  
+3. **LLM brain** — Turns diff + roast instructions into the comment text (Gemini, with Groq/Workers AI failover)
 4. **KV latch (optional)** — Stops you from accidentally exhausting free-tier quota  
 
 The slash command is only a **user-facing trigger**. All real work is webhook → verify → auth → diff → model → comment.
