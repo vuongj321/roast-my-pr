@@ -92,7 +92,7 @@ Responsibilities of the Worker:
 5. Fetch PR metadata and the diff
 6. Optionally check a daily rate limit in KV
 7. Call an LLM with the roast prompt (Gemini → Groq → OpenRouter)
-8. Post the ack and final roast comments
+8. Post the roast comment
 
 **Wrangler** is Cloudflare’s CLI used to develop (`wrangler dev`), set secrets, and deploy (`wrangler deploy`).
 
@@ -126,8 +126,7 @@ sequenceDiagram
   Human->>GitHub: Comment /roastmypr on a PR
   GitHub->>Worker: POST issue_comment webhook plus X-Hub-Signature-256
   Worker->>Worker: Verify HMAC signature with WEBHOOK_SECRET
-  Worker->>Worker: Ignore if not PR, not command, or author is a bot
-  Worker->>GitHub: Create ack comment
+  Worker->>Worker: Ignore if not PR, not /roastmypr, or author is a bot
   Worker->>KV: Check and increment daily roast count
   alt Over daily cap
     Worker->>GitHub: Comment free tier limit message
@@ -143,20 +142,20 @@ sequenceDiagram
 
 ### Step-by-step
 
-1. **Trigger** — A human comments on a pull request. The first line must match `/roastmypr` (aliases may include `/roast` and `/roast my pr`). `/roastmypr help` can return usage text without calling an LLM.
+1. **Trigger** — A human comments on a pull request. The first line must be exactly `/roastmypr` (no aliases or help subcommand).
 
 2. **Webhook delivery** — GitHub POSTs a JSON payload to the App’s webhook URL. Headers include the event name and `X-Hub-Signature-256`.
 
 3. **Signature verification** — The Worker recomputes an HMAC-SHA256 of the raw body using `WEBHOOK_SECRET` and compares it to the header. Mismatch → `401` and stop. This stops strangers from forging events against your public Worker URL.
 
-4. **Filtering** — Drop events that are not PR conversation comments, were authored by bots, or do not start with the command. Respond `200` quickly for ignored events so GitHub does not retry forever.
+4. **Filtering** — Drop events that are not PR conversation comments, were authored by bots, or do not start with `/roastmypr`. Respond `200` quickly for ignored events so GitHub does not retry forever.
 
-5. **Ack** — Post a short “roasting…” comment so the user sees immediate feedback while the model runs.
-
-6. **GitHub App authentication** — The Worker cannot use a personal password. It:
+5. **GitHub App authentication** — The Worker cannot use a personal password. It:
    - Builds a short-lived **JWT** signed with the App `PRIVATE_KEY` and `APP_ID`
    - Exchanges that JWT for an **installation access token** for the installation that owns the repo
    - Uses that token (via Octokit) for API calls
+
+6. **Rate limit** — Check and increment the daily roast counter in KV. If over the cap, post a limit message and stop.
 
 7. **Context load** — Fetch PR title, body, changed files, and patches. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
 
@@ -188,7 +187,7 @@ roast-my-pr/
 | Module | Responsibility |
 | --- | --- |
 | `index.ts` | Cloudflare `fetch` handler; webhook path; signature check; JSON parse |
-| `app.ts` | Business rules: is this a roast command? help vs roast; orchestrate steps |
+| `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, roast, and reply |
 | `github.ts` | All GitHub API interaction through Octokit |
 | `diffPack.ts` | Skip noisy files, prioritize source, pack patches to a budget |
 | `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover |
