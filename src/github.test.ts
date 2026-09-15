@@ -3,8 +3,10 @@ import { describe, it } from "node:test";
 import {
   isRoastBotComment,
   selectLatestPriorRoast,
+  selectLatestPriorRoastComment,
 } from "./github.js";
-import { ROAST_FOOTER_MARKER, buildRoastFooter } from "./prompts.js";
+import { ROAST_FOOTER_MARKER, buildRoastFooter, readRoastState } from "./prompts.js";
+import type { RoastState } from "./types.js";
 
 describe("isRoastBotComment", () => {
   it("detects footer-marked roast comments", () => {
@@ -21,7 +23,38 @@ describe("isRoastBotComment", () => {
   });
 });
 
-describe("selectLatestPriorRoast", () => {
+describe("selectLatestPriorRoastComment", () => {
+  it("returns the comment id alongside the body so state can be read", () => {
+    const state: RoastState = {
+      v: 1,
+      sha: "d63231d42ba562440d6812538ec72a2160ba37d1",
+      findings: [{ id: "F1", text: "- No transaction around provisioning." }],
+    };
+    const picked = selectLatestPriorRoastComment([
+      { id: 1, body: "/roastmypr" },
+      { id: 2, body: `older${buildRoastFooter("groq")}` },
+      { id: 4, body: `newer${buildRoastFooter("gemini-3.6-flash", state)}` },
+    ]);
+
+    assert.ok(picked);
+    assert.equal(picked!.id, 4);
+    const parsed = readRoastState(picked!.body);
+    assert.equal(parsed!.sha, state.sha);
+  });
+
+  it("returns null when nothing is footer-marked or it is excluded", () => {
+    assert.equal(selectLatestPriorRoastComment([{ id: 1, body: "lgtm" }]), null);
+    assert.equal(
+      selectLatestPriorRoastComment(
+        [{ id: 9, body: `roast${buildRoastFooter("groq")}` }],
+        9,
+      ),
+      null,
+    );
+  });
+});
+
+describe("selectLatestPriorRoast (deprecated wrapper)", () => {
   it("returns null when there are no roast comments", () => {
     assert.equal(
       selectLatestPriorRoast([

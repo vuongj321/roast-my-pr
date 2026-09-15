@@ -7,14 +7,19 @@ import {
   type PackOptions,
   type ProviderName,
 } from "./diffPack.js";
-import { filterRoastByPackedPaths } from "./pathFilter.js";
-import { buildUserPrompt, ROAST_SYSTEM_PROMPT } from "./prompts.js";
+import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting } from "./pathFilter.js";
+import {
+  buildPartialReviewNote,
+  buildUserPrompt,
+  ROAST_SYSTEM_PROMPT,
+} from "./prompts.js";
 import {
   extractModelText,
   isTruncatedRoastText,
   isUsableRoastText,
   logEmptyCompletionPayload,
 } from "./responseText.js";
+import type { PackCoverage, PriorFinding } from "./types.js";
 
 export class RoastQuotaError extends Error {
   constructor(message: string) {
@@ -46,6 +51,13 @@ export type RoastInput = {
   filesIncomplete: boolean;
   /** Latest prior bot roast body, if any (verified against current diff). */
   priorRoast?: string | null;
+  /** Addressable findings from the prior roast (F1..Fn). */
+  priorFindings?: PriorFinding[];
+  /** SHA the prior roast reviewed; enables the "what changed" delta. */
+  reviewedSha?: string | null;
+  /** Files changed between reviewedSha and the current head. */
+  deltaFiles?: DiffFile[];
+  deltaCommits?: number;
 };
 
 type ProviderFailure = {
@@ -131,27 +143,81 @@ function budgetForProvider(env: Env, provider: ProviderName): PackOptions {
   return base;
 }
 
-function buildPackedPrompt(
-  input: RoastInput,
-  budget: PackOptions,
-): {
+/** Share of a provider budget reserved for the "changes since last review" diff. */
+const DELTA_BUDGET_SHARE = 0.3;
+
+type SplitBudget = { diff: PackOptions; delta: PackOptions | null };
+
+/**
+ * Carve the delta pack out of the *same* provider budget, so adding a delta
+ * never pushes a free-tier prompt past its limit.
+ */
+function splitForDelta(budget: PackOptions, hasDelta: boolean): SplitBudget {
+  if (!hasDelta) return { diff: budget, delta: null };
+  const deltaTotal = Math.max(
+    1_500,
+    Math.round(budget.maxTotalChars * DELTA_BUDGET_SHARE),
+  );
+  return {
+    diff: {
+      ...budget,
+      maxTotalChars: Math.max(2_000, budget.maxTotalChars - deltaTotal),
+    },
+    delta: {
+      maxTotalChars: deltaTotal,
+      maxPerFileChars: Math.max(800, Math.round(budget.maxPerFileChars * 0.8)),
+      maxBodyChars: 200,
+    },
+  };
+}
+
+/** Files cited by the prior review get packed first in both the diff and delta. */
+function priorityPathsFor(input: RoastInput): Set<string> {
+  const paths = new Set(extractCitedPaths(input.priorRoast || ""));
+  for (const finding of input.priorFindings ?? []) {
+    if (finding.path) paths.add(finding.path);
+  }
+  return paths;
+}
+
+type PackedPrompt = {
   userPrompt: string;
   truncated: boolean;
   packedDiff: string;
   includedFilenames: string[];
-} {
-  const priorityPaths = new Set(extractCitedPaths(input.priorRoast || ""));
+  coverage: PackCoverage;
+};
+
+function buildPackedPrompt(input: RoastInput, budget: PackOptions): PackedPrompt {
+  const priorityPaths = priorityPathsFor(input);
+  const deltaFiles = input.deltaFiles ?? [];
+  const { diff: diffBudget, delta: deltaBudgetOptions } = splitForDelta(
+    budget,
+    deltaFiles.length > 0,
+  );
+
   const packed = packPullContext(
     input.files,
     input.body,
-    budget,
+    diffBudget,
     input.filesIncomplete,
     priorityPaths,
   );
+
+  const delta = deltaBudgetOptions
+    ? packPullContext(deltaFiles, "", deltaBudgetOptions, false, priorityPaths)
+    : null;
+
   return {
     truncated: packed.truncated,
     packedDiff: packed.diff,
     includedFilenames: packed.includedFilenames,
+    coverage: {
+      includedFiles: packed.includedFiles,
+      totalFiles: packed.totalFiles,
+      shownChars: packed.shownPatchChars,
+      totalChars: packed.totalPatchChars,
+    },
     userPrompt: buildUserPrompt({
       owner: input.owner,
       repo: input.repo,
@@ -163,7 +229,18 @@ function buildPackedPrompt(
       truncated: packed.truncated,
       includedFiles: packed.includedFiles,
       totalFiles: packed.totalFiles,
+      partialFiles: packed.partialFiles,
       priorRoast: input.priorRoast,
+      priorFindings: input.priorFindings,
+      reviewedSha: input.reviewedSha,
+      reviewDelta: delta
+        ? {
+            diff: delta.diff,
+            commits: input.deltaCommits ?? 0,
+            files: delta.includedFilenames,
+            truncated: delta.truncated,
+          }
+        : null,
     }),
   };
 }
@@ -186,6 +263,8 @@ export type RoastResult = {
   text: string;
   provider: ProviderName;
   model: string;
+  /** How much of the PR this run actually saw (written to the footer). */
+  coverage: PackCoverage;
 };
 
 async function callGemini(env: Env, userPrompt: string): Promise<string> {
@@ -417,22 +496,15 @@ async function runWithShrinkRetry(
   provider: ProviderName,
   budget: PackOptions,
   call: (userPrompt: string) => Promise<string>,
-): Promise<{
-  text: string;
-  packedDiff: string;
-  includedFilenames: string[];
-}> {
+): Promise<PackedPrompt & { text: string }> {
   let current = budget;
   let lastErr: unknown;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { userPrompt, packedDiff, includedFilenames } = buildPackedPrompt(
-      input,
-      current,
-    );
+    const packed = buildPackedPrompt(input, current);
     try {
-      const text = await call(userPrompt);
-      return { text, packedDiff, includedFilenames };
+      const text = await call(packed.userPrompt);
+      return { ...packed, text };
     } catch (err) {
       lastErr = err;
       // Groq free tier is 8k TPM: an empty→shrink retry often rate-limits the
@@ -474,11 +546,7 @@ export async function generateRoast(
     name: ProviderName;
     model: string;
     enabled: boolean;
-    run: () => Promise<{
-      text: string;
-      packedDiff: string;
-      includedFilenames: string[];
-    }>;
+    run: () => Promise<PackedPrompt & { text: string }>;
   }> = [
     {
       name: "gemini",
@@ -540,7 +608,7 @@ export async function generateRoast(
 
   for (const attempt of configured) {
     try {
-      const { text, includedFilenames } = await attempt.run();
+      const { text, includedFilenames, coverage } = await attempt.run();
       if (!text.trim()) {
         failures.push({
           provider: attempt.name,
@@ -549,16 +617,48 @@ export async function generateRoast(
         });
         continue;
       }
-      const filtered = filterRoastByPackedPaths(text, includedFilenames);
+
+      // Pull the F1/F2 accounting out first: those lines are bookkeeping, not
+      // review prose, and they would otherwise look like unpinned bullets.
+      const { accounting, text: roastBody } = parseFindingAccounting(text);
+      if (accounting.size > 0) {
+        console.error(
+          `Roast accounting (${attempt.name}): ${[...accounting]
+            .map(([id, status]) => `${id}=${status}`)
+            .join(" ")}`,
+        );
+      }
+
+      const filtered = filterRoastByPackedPaths(roastBody, includedFilenames);
       if (filtered.dropped > 0) {
         console.error(
           `Roast path filter (${attempt.name}): kept=${filtered.kept} dropped=${filtered.dropped}`,
         );
       }
+
+      const deduped = dropResolvedRepeats(
+        filtered.text,
+        input.priorFindings,
+        accounting,
+      );
+      if (deduped.dropped > 0) {
+        console.error(
+          `Roast repeat filter (${attempt.name}): dropped=${deduped.dropped} bullet(s) re-raising findings marked resolved`,
+        );
+      }
+
+      const coverageNote = buildPartialReviewNote(coverage);
+      if (coverageNote) {
+        console.error(
+          `Roast coverage (${attempt.name}): ${coverage.includedFiles}/${coverage.totalFiles} files, ${coverage.shownChars}/${coverage.totalChars} patch chars — labelled partial`,
+        );
+      }
+
       return {
-        text: filtered.text,
+        text: coverageNote ? `${coverageNote}\n\n${deduped.text}` : deduped.text,
         provider: attempt.name,
         model: attempt.model,
+        coverage,
       };
     } catch (err) {
       const failure = failureFromUnknown(attempt.name, err);

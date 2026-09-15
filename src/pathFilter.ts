@@ -4,6 +4,7 @@
  */
 
 import { extractCitedPaths, matchesPriorityPath } from "./diffPack.js";
+import type { FindingStatus, PriorFinding } from "./types.js";
 
 export const PATH_STRIPPED_NOTE =
   "_Note: Some bullets cited files that were not in the packed diff and were omitted._";
@@ -197,4 +198,157 @@ export function filterRoastByPackedPaths(
     kept,
     dropped,
   };
+}
+
+/** Roast bullets are treated as a repeat above this many shared keywords. */
+const REPEAT_MIN_SHARED_WORDS = 2;
+
+/**
+ * `- F1 resolved` / `- F2 still present — "quoted line"` accounting lines that
+ * the prompt asks for at the top of the reply.
+ */
+const ACCOUNTING_RE =
+  /^\s*(?:[-*+]|\d+\.)?\s*\**\s*(F\d+)\b[^A-Za-z]*(resolved|fixed|done|still\s*present|still\s*broken|unfixed|unverifiable|unknown|not\s*shown)\b/i;
+
+/** Words too generic to prove two findings are the same complaint. */
+const STOP_WORDS = new Set([
+  "the", "and", "that", "this", "with", "from", "your", "you", "are", "was",
+  "were", "for", "not", "but", "its", "has", "have", "had", "using", "use",
+  "uses", "used", "into", "when", "what", "which", "there", "their", "them",
+  "then", "than", "also", "just", "only", "over", "under", "about", "after",
+  "before", "because", "should", "would", "could", "must", "does", "did",
+  "doing", "been", "being", "all", "any", "can", "will", "they", "these",
+  "those", "where", "while", "whom", "whose", "how", "why", "out", "off",
+  "own", "same", "too", "very", "more", "most", "much", "many", "some",
+  "such", "each", "both", "few", "other", "another", "again", "once", "here",
+  "now", "make", "makes", "made", "get", "gets", "got", "lets", "instead",
+  "without", "within", "across", "between", "though", "however", "per", "via",
+  "code", "file", "files", "line", "lines", "path", "paths", "calls", "call",
+  "called", "throws", "throw",
+]);
+
+function significantWords(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[`*_#>\[\](){}'"]/g, " ")
+      .split(/[^a-z0-9_.-]+/)
+      .filter(
+        (word) =>
+          word.length > 3 && !word.includes("/") && !STOP_WORDS.has(word),
+      ),
+  );
+}
+
+/**
+ * Words with cited file paths removed. Two findings about different bugs in the
+ * same file share the path tokens, which would look like a repeat.
+ */
+function wordsWithoutPaths(text: string): Set<string> {
+  let stripped = text;
+  for (const path of extractCitedPaths(text)) {
+    stripped = stripped.split(path).join(" ");
+    const base = path.split("/").pop();
+    if (base) stripped = stripped.split(base).join(" ");
+  }
+  return significantWords(stripped);
+}
+
+/**
+ * Pull the model's finding accounting out of a roast and return the roast
+ * without those lines (they are bookkeeping, not review prose).
+ */
+export function parseFindingAccounting(roastText: string): {
+  accounting: Map<string, FindingStatus>;
+  text: string;
+} {
+  const accounting = new Map<string, FindingStatus>();
+  const kept: string[] = [];
+
+  for (const line of (roastText || "").split(/\r?\n/)) {
+    const match = line.match(ACCOUNTING_RE);
+    if (!match) {
+      kept.push(line);
+      continue;
+    }
+    const id = match[1]!.toUpperCase();
+    const word = match[2]!.toLowerCase().replace(/\s+/g, "");
+    const status: FindingStatus =
+      word === "resolved" || word === "fixed" || word === "done"
+        ? "resolved"
+        : word === "unverifiable" || word === "unknown" || word === "notshown"
+          ? "unverifiable"
+          : "stillPresent";
+    accounting.set(id, status);
+  }
+
+  const text = kept
+    .join("\n")
+    .replace(/\n*#{1,6}[^\n]*\b(prior findings?|accounting|verification)\b[^\n]*\n/gi, "\n")
+    .trim();
+  return { accounting, text };
+}
+
+/** True when this bullet looks like the same complaint as `finding`. */
+export function bulletRepeatsFinding(
+  bullet: string,
+  finding: PriorFinding,
+): boolean {
+  const bulletWords = wordsWithoutPaths(bullet);
+  const findingWords = wordsWithoutPaths(finding.text);
+  let shared = 0;
+  for (const word of bulletWords) {
+    if (findingWords.has(word)) shared += 1;
+  }
+  if (shared === 0) return false;
+
+  const cited = extractCitedPaths(bullet);
+  if (finding.path) {
+    const sameFile = cited.some((p) =>
+      matchesPriorityPath(p, new Set([finding.path!])),
+    );
+    if (sameFile) return shared >= REPEAT_MIN_SHARED_WORDS;
+    if (cited.length > 0) return false;
+  }
+  return shared > REPEAT_MIN_SHARED_WORDS;
+}
+
+/**
+ * Safety net for self-contradiction: if the model marked a finding resolved and
+ * then raised it again in a bullet, drop the bullet.
+ *
+ * Deliberately conservative — a repeat the model never declared resolved is left
+ * alone (the prompt and the review delta are what stop those, not a regex).
+ */
+export function dropResolvedRepeats(
+  roastText: string,
+  priorFindings: readonly PriorFinding[] | undefined,
+  accounting: ReadonlyMap<string, FindingStatus>,
+): { text: string; dropped: number } {
+  const text = (roastText || "").trim();
+  if (!text || !priorFindings?.length || accounting.size === 0) {
+    return { text, dropped: 0 };
+  }
+
+  const resolved = priorFindings.filter(
+    (f) => accounting.get(f.id.toUpperCase()) === "resolved",
+  );
+  if (resolved.length === 0) return { text, dropped: 0 };
+
+  const kept: string[] = [];
+  let dropped = 0;
+  for (const line of text.split(/\r?\n/)) {
+    const isBullet = /^\s*(?:[-*+]|\d+\.)\s+\S/.test(line);
+    if (isBullet && resolved.some((f) => bulletRepeatsFinding(line, f))) {
+      dropped += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+
+  if (dropped === 0) return { text, dropped: 0 };
+
+  // Collapse blank runs left behind by removed bullets.
+  const cleaned = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { text: cleaned || text, dropped };
 }

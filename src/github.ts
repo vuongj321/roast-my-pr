@@ -14,13 +14,14 @@ export function isRoastBotComment(body: string | null | undefined): boolean {
 }
 
 /**
- * Pick the most recent prior roast body from issue comments (oldest→newest order).
+ * Pick the most recent prior roast comment (oldest→newest order).
+ * Returns the comment id too, so callers can read its embedded state.
  */
-export function selectLatestPriorRoast(
+export function selectLatestPriorRoastComment(
   comments: IssueCommentLike[],
   excludeCommentId?: number,
-): string | null {
-  let latest: string | null = null;
+): { id: number; body: string } | null {
+  let latest: { id: number; body: string } | null = null;
   for (const comment of comments) {
     if (
       excludeCommentId !== undefined &&
@@ -29,9 +30,17 @@ export function selectLatestPriorRoast(
       continue;
     }
     if (!isRoastBotComment(comment.body)) continue;
-    latest = (comment.body || "").trim();
+    latest = { id: comment.id, body: (comment.body || "").trim() };
   }
-  return latest || null;
+  return latest;
+}
+
+/** @deprecated Use selectLatestPriorRoastComment */
+export function selectLatestPriorRoast(
+  comments: IssueCommentLike[],
+  excludeCommentId?: number,
+): string | null {
+  return selectLatestPriorRoastComment(comments, excludeCommentId)?.body ?? null;
 }
 
 function normalizePrivateKey(pem: string): string {
@@ -107,6 +116,10 @@ export interface PullContext {
   files: DiffFile[];
   /** True when pagination stopped early (~300 files). */
   filesIncomplete: boolean;
+  /** Head commit SHA at fetch time — the anchor written into review state. */
+  headSha?: string;
+  /** Base commit SHA of the PR. */
+  baseSha?: string;
 }
 
 /**
@@ -159,20 +172,81 @@ export async function fetchPullContext(
     author: pr.user?.login || "unknown",
     files,
     filesIncomplete,
+    headSha: pr.head?.sha,
+    baseSha: pr.base?.sha,
   };
 }
 
+/** GitHub caps a single comparison at 300 files. */
+const MAX_COMPARE_FILES = 300;
+
+export type ReviewDelta = {
+  files: DiffFile[];
+  commits: number;
+  /** True when the comparison hit GitHub's 300-file cap. */
+  truncated: boolean;
+  /** True when a SHA is gone (force-push) or the comparison failed. */
+  unavailable: boolean;
+};
+
 /**
- * Load the latest prior Roast my PR comment on this issue/PR (footer-marked).
+ * What changed between the commit we last reviewed and the current head.
+ *
+ * This is the signal that stops the bot re-reporting items the author already
+ * fixed: it is the only input that distinguishes "still broken" from "you could
+ * not see it in the packed diff".
+ */
+export async function fetchReviewDelta(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  baseSha: string,
+  headSha: string,
+): Promise<ReviewDelta> {
+  const empty: ReviewDelta = {
+    files: [],
+    commits: 0,
+    truncated: false,
+    unavailable: true,
+  };
+  if (!baseSha || !headSha || baseSha === headSha) return empty;
+
+  try {
+    const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+      owner,
+      repo,
+      basehead: `${baseSha}...${headSha}`,
+    });
+    const entries = data.files ?? [];
+    const files: DiffFile[] = entries.slice(0, MAX_COMPARE_FILES).map((f) => ({
+      filename: f.filename,
+      status: f.status,
+      patch: f.patch,
+    }));
+    return {
+      files,
+      commits: data.commits?.length ?? 0,
+      truncated: entries.length > MAX_COMPARE_FILES,
+      unavailable: false,
+    };
+  } catch (err) {
+    console.error("Review delta unavailable", formatGithubError(err));
+    return empty;
+  }
+}
+
+/**
+ * Load the latest prior Roast my PR comment (footer-marked) with its id, so the
+ * caller can also read the review state hidden in its footer.
  * Caps at ~100 comments to keep Worker latency bounded.
  */
-export async function fetchLatestPriorRoast(
+export async function fetchLatestPriorRoastComment(
   octokit: Octokit,
   owner: string,
   repo: string,
   issueNumber: number,
   excludeCommentId?: number,
-): Promise<string | null> {
+): Promise<{ id: number; body: string } | null> {
   const comments: IssueCommentLike[] = [];
   const perPage = 100;
   const { data } = await octokit.rest.issues.listComments({
@@ -198,7 +272,25 @@ export async function fetchLatestPriorRoast(
       comments.push({ id: c.id, body: c.body });
     }
   }
-  return selectLatestPriorRoast(comments, excludeCommentId);
+  return selectLatestPriorRoastComment(comments, excludeCommentId);
+}
+
+/** @deprecated Use fetchLatestPriorRoastComment */
+export async function fetchLatestPriorRoast(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  excludeCommentId?: number,
+): Promise<string | null> {
+  const comment = await fetchLatestPriorRoastComment(
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    excludeCommentId,
+  );
+  return comment?.body ?? null;
 }
 
 /** @deprecated Use fetchPullContext */
