@@ -31,7 +31,7 @@ flowchart LR
 
   subgraph cloudflare [Your Cloudflare account]
     Worker[Cloudflare Worker]
-    KV[KV rate-limit store optional]
+    KV[KV rate-limit store]
     AIBind[Workers AI binding]
     Secrets[Secrets APP_ID PRIVATE_KEY WEBHOOK_SECRET GEMINI_API_KEY optional GROQ]
   end
@@ -92,7 +92,7 @@ Responsibilities of the Worker:
 3. Parse the event and decide if it is a `/roastmypr` command on a PR
 4. Authenticate to the GitHub API as the App installation
 5. Fetch PR metadata and the diff
-6. Optionally check a daily rate limit in KV
+6. Check a daily rate limit in KV
 7. Call an LLM with the roast prompt (Gemini → Groq → Workers AI)
 8. Post the roast comment
 
@@ -111,9 +111,9 @@ Packing is **provider-specific**. Gemini can take a larger diff; Groq’s free-t
 
 The first successful provider returns text; the Worker posts that text to GitHub. Gemini and Groq are external HTTP APIs; Workers AI runs through Cloudflare’s `env.AI` binding.
 
-### 3.4 Optional Cloudflare KV (quota guardrail)
+### 3.4 Cloudflare KV (quota guardrail)
 
-KV is a simple key-value store. We can use it to track something like `installationId:YYYY-MM-DD → roast count` and refuse or defer when a soft daily cap is hit. That protects *your* free-tier limits from accidental spam on your own repos. It is not multi-tenant isolation (this architecture is account-only / self-hosted).
+KV is a simple key-value store. The Worker binds a `RATE_LIMIT` namespace and tracks `roast:{installationId}:{YYYY-MM-DD} → roast count`, refusing new roasts when the soft daily cap (`DAILY_ROAST_LIMIT`) is hit. That protects *your* free-tier limits from accidental spam on your own repos. It is not multi-tenant isolation (this architecture is account-only / self-hosted).
 
 ## 4. Request lifecycle (happy path)
 
@@ -146,13 +146,13 @@ sequenceDiagram
 
 ### Step-by-step
 
-1. **Trigger** — A human comments on a pull request. The first line must be exactly `/roastmypr` (no aliases or help subcommand).
+1. **Trigger** — A human comments on a pull request. The first line must be `/roastmypr` alone (case-insensitive; surrounding whitespace allowed; no aliases or help subcommand).
 
 2. **Webhook delivery** — GitHub POSTs a JSON payload to the App’s webhook URL. Headers include the event name and `X-Hub-Signature-256`.
 
 3. **Signature verification** — The Worker recomputes an HMAC-SHA256 of the raw body using `WEBHOOK_SECRET` and compares it to the header. Mismatch → `401` and stop. This stops strangers from forging events against your public Worker URL.
 
-4. **Filtering** — Drop events that are not PR conversation comments, were authored by bots, or do not start with `/roastmypr`. Respond `200` quickly for ignored events so GitHub does not retry forever.
+4. **Filtering** — Drop events that are not PR conversation comments, were authored by bots, or whose first line is not `/roastmypr` alone. Respond `200` quickly for ignored events so GitHub does not retry forever.
 
 5. **GitHub App authentication** — The Worker cannot use a personal password. It:
    - Builds a short-lived **JWT** signed with the App `PRIVATE_KEY` and `APP_ID`
@@ -178,12 +178,15 @@ roast-my-pr/
   src/
     index.ts                 # HTTP entry: route + signature verify + dispatch
     app.ts                   # issue_comment handling and /roastmypr routing
+    command.ts               # Parse first-line /roastmypr
     github.ts                # App JWT, installation Octokit, PR context, comments
     diffPack.ts              # Noise filtering + per-provider diff budgets
     pathFilter.ts            # Strip bullets citing paths outside packed set
     roast.ts                 # LLM client with Gemini → Groq → Workers AI failover
+    responseText.ts          # Normalize / extract usable model completions
     prompts.ts               # Roast personality and output format
-    rateLimit.ts             # Optional KV daily caps
+    rateLimit.ts             # KV daily caps
+    types.ts                 # Env and command types
   docs/
     ARCHITECTURE.md          # This file
   README.md                  # Self-host setup guide
@@ -193,12 +196,15 @@ roast-my-pr/
 | --- | --- |
 | `index.ts` | Cloudflare `fetch` handler; webhook path; signature check; JSON parse |
 | `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, roast, and reply |
+| `command.ts` | Parse the first line of a comment for `/roastmypr` |
 | `github.ts` | All GitHub API interaction through Octokit (including prior roast lookup) |
 | `diffPack.ts` | Skip noisy files, prioritize source / prior-cited paths, pack patches to a budget |
 | `pathFilter.ts` | Drop roast bullets that cite file paths not in the packed set |
 | `roast.ts` | Multi-provider LLM request/response, per-provider packing, failover, path filter |
+| `responseText.ts` | Turn provider JSON into plain roast text; prefer `content` over unfinished reasoning |
 | `prompts.ts` | Prompt text kept separate so tone can be tuned without touching I/O |
-| `rateLimit.ts` | Read/increment KV counters |
+| `rateLimit.ts` | Read/increment KV counters (`RATE_LIMIT` binding required) |
+| `types.ts` | Shared `Env` and `RoastCommand` types |
 
 **Octokit** is the TypeScript client for GitHub’s REST API. We use it directly (plus app-auth helpers) instead of the full **Probot** framework, because Probot assumes a more traditional Node server while Workers use a `fetch` handler model.
 
@@ -287,7 +293,7 @@ They do **not** install your App onto their account when the App is **Only on th
 | Command without install / missing permission | Error comment or logged failure; no crash loop |
 | Diff too large | Truncate; note in roast that review is partial |
 | All configured LLMs rate-limited / quota | User-visible “try later” comment |
-| Optional KV daily cap exceeded | User-visible limit comment; no LLM call |
+| KV daily cap exceeded | User-visible limit comment; no LLM call |
 
 ## 10. Explicit non-goals (v1)
 
@@ -305,7 +311,7 @@ Think of the system as three doors and one brain:
 1. **GitHub App door** — Who is allowed to act in which repos, and which events are sent  
 2. **Worker door** — Public HTTPS endpoint that only trusts signed GitHub traffic  
 3. **LLM brain** — Turns diff + roast instructions into the comment text (Gemini, with Groq/Workers AI failover)
-4. **KV latch (optional)** — Stops you from accidentally exhausting free-tier quota  
+4. **KV latch** — Stops you from accidentally exhausting free-tier quota  
 
 The slash command is only a **user-facing trigger**. All real work is webhook → verify → auth → diff → model → comment.
 

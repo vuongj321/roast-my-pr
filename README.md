@@ -14,7 +14,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deep dive.
 
 ## Commands
 
-Comment `/roastmypr` as the first line of a PR comment to get a full roast review.
+Comment `/roastmypr` as the first line of a PR comment to get a full roast review (case-insensitive; surrounding whitespace allowed).
 
 ## Quick start (self-host)
 
@@ -129,8 +129,10 @@ src/
   diffPack.ts        Noise filtering + per-provider diff budgets
   pathFilter.ts      Strip bullets citing paths outside packed set
   roast.ts           LLM client (Gemini → Groq → Workers AI)
+  responseText.ts    Normalize / extract usable model completions
   prompts.ts         Roast personality
   rateLimit.ts       KV daily caps
+  types.ts           Env and command types
 docs/
   ARCHITECTURE.md
   GITHUB_APP_SETUP.md
