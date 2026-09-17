@@ -2,14 +2,14 @@
 
 Self-hosted GitHub App that roasts pull requests when someone comments `/roastmypr`.
 
-Runs on **Cloudflare Workers** (free tier) with free-tier LLMs: **Google Gemini** (primary), optional **Groq**, then **Workers AI** failover. No paid APIs required. Account-only install: your App only works on your account’s repos. Anyone else who wants the bot should clone this repo and deploy their own copy.
+Runs on **Cloudflare Workers** (free tier) with free-tier LLMs: **Google Gemini** (primary), **Workers AI**, then optional **Groq** as last resort. No paid APIs required. Account-only install: your App only works on your account’s repos. Anyone else who wants the bot should clone this repo and deploy their own copy.
 
 ## How it works
 
 1. You comment `/roastmypr` on a PR (first line of the comment).
 2. GitHub sends an `issue_comment` webhook to your Worker.
 3. The Worker verifies the signature, loads the PR diff, and reads the review state left by the previous roast (reviewed SHA + findings).
-4. It calls Gemini (falling back to Groq then Workers AI on capacity/quota errors) and posts the roast. The footer carries fresh state, so the next roast knows what it already said.
+4. It calls Gemini (falling back to Workers AI then Groq on capacity/quota errors) and posts the roast. The footer carries fresh state, so the next roast knows what it already said.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deep dive.
 
@@ -21,7 +21,7 @@ The bot keeps memory of its own review in the comment footer (an invisible HTML 
 - On the next run the Worker asks GitHub's compare API for **what changed since that SHA** and tells the model those changes are the author's fixes. The model must answer every finding `resolved`, `still present — "<quote>"`, or `unverifiable` (it is told to say "unverifiable" rather than repeat something it cannot see).
 - Bullets that contradict that accounting — re-raising something the model itself marked resolved — are dropped before posting.
 - Files are packed **by hunk**, not by truncating the tail of a patch, and clipped files are named to the model as partially shown.
-- If a run only covers a fraction of the PR (typical on the Groq fallback), the comment starts with `Partial review: only N of M changed files…` instead of pretending it saw everything.
+- If a run only covers a fraction of the PR (typical on the thin Groq last-resort pack), the comment starts with `Partial review: only N of M changed files…` instead of pretending it saw everything.
 
 ## Commands
 
@@ -35,7 +35,7 @@ Comment `/roastmypr` as the first line of a PR comment to get a full roast revie
 - A [Cloudflare](https://dash.cloudflare.com/sign-up) account (Workers AI uses your Worker’s `AI` binding — no extra API key)
 - A GitHub account
 - A [Google AI Studio](https://aistudio.google.com/apikey) API key (free tier)
-- Optional: [Groq](https://console.groq.com/keys) API key for failover
+- Optional: [Groq](https://console.groq.com/keys) API key for last-resort failover
 
 ### 1. Clone and install
 
@@ -78,7 +78,7 @@ npx wrangler secret put APP_ID
 npx wrangler secret put WEBHOOK_SECRET
 npx wrangler secret put PRIVATE_KEY
 npx wrangler secret put GEMINI_API_KEY
-# Optional Groq failover:
+# Optional Groq last-resort failover:
 npx wrangler secret put GROQ_API_KEY
 ```
 
@@ -93,12 +93,12 @@ Optional vars in `wrangler.toml` (not secret):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Primary model id (AI Studio free tier) |
-| `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq fallback model |
-| `WORKERS_AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Workers AI failover model |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq last-resort model |
+| `WORKERS_AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Workers AI fallback model |
 | `DAILY_ROAST_LIMIT` | `20` | Soft per-installation daily cap |
 | `MAX_DIFF_CHARS` | `48000` | Ceiling on packed diff size (per-provider budgets are lower for Groq) |
 
-Failover order: **Gemini → Groq → Workers AI**. Groq is skipped if its API key is unset; Workers AI runs when the `AI` binding is present.
+Failover order: **Gemini → Workers AI → Groq**. Workers AI runs when the `AI` binding is present; Groq is skipped if its API key is unset. Groq is last because its free-tier pack is tiny and weak models invent claims on thin slices.
 
 Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized, and each provider gets a budget that fits its free-tier limits. Within a file the packer keeps the **added-code-dense hunks** (the ones where fixes live) and marks the file `[partial: 3 of 8 hunks]`, so a 12 KB file no longer loses its last functions to a tail truncation. If a provider rejects the prompt as too large or returns an empty completion, the Worker shrinks the pack and retries once. The "changes since your last review" diff is carved out of the same budget, so review memory never inflates the prompt.
 
@@ -138,8 +138,8 @@ src/
   command.ts         /roastmypr parsing
   github.ts          App auth, PR context fetch, comments
   diffPack.ts        Noise filtering + hunk-level packing + per-provider budgets
-  pathFilter.ts      Path filter, F1/F2 accounting, resolved-repeat removal
-  roast.ts           LLM client (Gemini → Groq → Workers AI)
+  pathFilter.ts      Path filter, evidence/intent gates, F1 accounting, hedge strip
+  roast.ts           LLM client (Gemini → Workers AI → Groq)
   responseText.ts    Normalize / extract usable model completions
   prompts.ts         Roast personality, review state, coverage warnings
   rateLimit.ts       KV daily caps

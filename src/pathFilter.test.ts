@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  ABSOLUTE_CLAIM_STRIPPED_NOTE,
+  INTENT_FIXIT_STRIPPED_NOTE,
   INCOMPLETE_PACK_NOTE,
   PATH_STRIPPED_NOTE,
+  absoluteClaimHasPackedEvidence,
   bulletPathsArePacked,
   bulletRepeatsFinding,
+  dropIntentContradictingFixIts,
   dropResolvedRepeats,
   filterRoastByPackedPaths,
+  filterUnverifiedAbsoluteClaims,
   parseFindingAccounting,
   stripHedgeCloser,
 } from "./pathFilter.js";
@@ -219,6 +224,19 @@ I'll take a pass when the code compiles and we need full context.`;
     assert.match(text, /Align the type/);
   });
 
+  it("removes closers that punt to the rest of the diff", () => {
+    const roast = `Messy state dump.
+
+### Fix it
+- Align the types.
+
+You still have to read the rest of the diff to see the real problems.`;
+    const { text, stripped } = stripHedgeCloser(roast);
+    assert.equal(stripped, true);
+    assert.doesNotMatch(text, /rest of the diff/);
+    assert.match(text, /Align the types/);
+  });
+
   it("keeps a closer that judges the code", () => {
     const roast = `Messy diff.
 
@@ -229,5 +247,92 @@ Ship it when the tests pass, not before.`;
     const { text, stripped } = stripHedgeCloser(roast);
     assert.equal(stripped, false);
     assert.match(text, /Ship it when the tests pass/);
+  });
+});
+
+describe("filterUnverifiedAbsoluteClaims", () => {
+  const packed = `
+--- src/diffPack.ts (modified)
++function isAddedLine(line: string): boolean {
++  return line.startsWith("+") && !line.startsWith("+++");
++}
+`;
+
+  it("keeps absolute claims that quote packed code", () => {
+    const roast = `Headline.
+
+### What I'd send back
+- \`isAddedLine\` never guards \`!line.startsWith("+++")\` wait it does: \`!line.startsWith("+++")\`
+
+### Fix it
+- Keep the guard.
+`;
+    const { text, dropped } = filterUnverifiedAbsoluteClaims(roast, packed);
+    assert.equal(dropped, 0);
+    assert.match(text, /isAddedLine/);
+  });
+
+  it("drops absolute claims with no packed quote", () => {
+    const roast = `Headline.
+
+### What I'd send back
+- splitPatchHunks blindly trusts every + line with no guard against +++ headers.
+
+### Fix it
+- Add a guard.
+`;
+    const { text, dropped } = filterUnverifiedAbsoluteClaims(roast, packed);
+    assert.ok(dropped >= 1);
+    assert.match(text, new RegExp(ABSOLUTE_CLAIM_STRIPPED_NOTE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(text, /blindly trusts/);
+  });
+
+  it("exports absoluteClaimHasPackedEvidence for unit checks", () => {
+    assert.equal(
+      absoluteClaimHasPackedEvidence(
+        '- never guards `!line.startsWith("+++")`',
+        packed,
+      ),
+      true,
+    );
+    assert.equal(
+      absoluteClaimHasPackedEvidence("- never guards against +++ headers", packed),
+      false,
+    );
+  });
+});
+
+describe("dropIntentContradictingFixIts", () => {
+  it("drops Fix-its that undo footer-state constraints from commits", () => {
+    const roast = `Headline.
+
+### What I'd send back
+- The footer carries state.
+
+### Fix it
+- Remove the hidden roastmypr-state comment and serialize in a dedicated JSON block.
+- Align the types with the returned object.
+`;
+    const { text, dropped } = dropIntentContradictingFixIts(roast, [
+      "feat(roast): remember findings in footer — no KV binding needed",
+      "docs: document hidden state footer",
+    ]);
+    assert.equal(dropped, 1);
+    assert.match(text, new RegExp(INTENT_FIXIT_STRIPPED_NOTE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(text, /Remove the hidden/);
+    assert.match(text, /Align the types/);
+  });
+
+  it("is a no-op without constraint-like commits", () => {
+    const roast = `Headline.
+
+### Fix it
+- Remove the hidden state comment.
+`;
+    const { dropped, text } = dropIntentContradictingFixIts(roast, [
+      "feat: add widgets",
+    ]);
+    assert.equal(dropped, 0);
+    assert.match(text, /Remove the hidden/);
   });
 });

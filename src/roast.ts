@@ -7,7 +7,7 @@ import {
   type PackOptions,
   type ProviderName,
 } from "./diffPack.js";
-import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting, stripHedgeCloser } from "./pathFilter.js";
+import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting, stripHedgeCloser, filterUnverifiedAbsoluteClaims, dropIntentContradictingFixIts } from "./pathFilter.js";
 import {
   buildPartialReviewNote,
   buildUserPrompt,
@@ -539,8 +539,9 @@ async function runWithShrinkRetry(
 }
 
 /**
- * Generate a roast via Gemini, falling back to Groq then Workers AI on failure.
+ * Generate a roast via Gemini, falling back to Workers AI then Groq on failure.
  * Each provider gets a budget-sized pack of the same PR files (not one shared megaprompt).
+ * Groq is last: its 6k pack + weak instruction-following invents claims on thin slices.
  */
 export async function generateRoast(
   env: Env,
@@ -564,6 +565,18 @@ export async function generateRoast(
           "gemini",
           budgetForProvider(env, "gemini"),
           (userPrompt) => callGemini(env, userPrompt),
+        ),
+    },
+    {
+      name: "workersai",
+      model: workersAiModel(env),
+      enabled: Boolean(env.AI),
+      run: () =>
+        runWithShrinkRetry(
+          input,
+          "workersai",
+          budgetForProvider(env, "workersai"),
+          (userPrompt) => callWorkersAi(env, userPrompt),
         ),
     },
     {
@@ -593,18 +606,6 @@ export async function generateRoast(
             }),
         ),
     },
-    {
-      name: "workersai",
-      model: workersAiModel(env),
-      enabled: Boolean(env.AI),
-      run: () =>
-        runWithShrinkRetry(
-          input,
-          "workersai",
-          budgetForProvider(env, "workersai"),
-          (userPrompt) => callWorkersAi(env, userPrompt),
-        ),
-    },
   ];
 
   const configured = attempts.filter((a) => a.enabled);
@@ -614,7 +615,7 @@ export async function generateRoast(
 
   for (const attempt of configured) {
     try {
-      const { text, includedFilenames, coverage, truncated } =
+      const { text, includedFilenames, coverage, truncated, packedDiff } =
         await attempt.run();
       if (!text.trim()) {
         failures.push({
@@ -643,8 +644,18 @@ export async function generateRoast(
         );
       }
 
-      const deduped = dropResolvedRepeats(
+      const evidenced = filterUnverifiedAbsoluteClaims(
         filtered.text,
+        packedDiff,
+      );
+      if (evidenced.dropped > 0) {
+        console.error(
+          `Roast evidence filter (${attempt.name}): kept=${evidenced.kept} dropped=${evidenced.dropped}`,
+        );
+      }
+
+      const deduped = dropResolvedRepeats(
+        evidenced.text,
         input.priorFindings,
         accounting,
       );
@@ -654,7 +665,17 @@ export async function generateRoast(
         );
       }
 
-      const dehedged = stripHedgeCloser(deduped.text);
+      const intented = dropIntentContradictingFixIts(
+        deduped.text,
+        input.commitMessages ?? [],
+      );
+      if (intented.dropped > 0) {
+        console.error(
+          `Roast intent filter (${attempt.name}): dropped=${intented.dropped} Fix-it bullet(s) undoing stated commit constraints`,
+        );
+      }
+
+      const dehedged = stripHedgeCloser(intented.text);
 
       const coverageNote = buildPartialReviewNote(coverage, {
         provider: attempt.name,
