@@ -352,3 +352,52 @@ export function dropResolvedRepeats(
   const cleaned = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   return { text: cleaned || text, dropped };
 }
+
+/** Closers that judge the review's epistemic status instead of the code. */
+const HEDGE_CLOSER_RE =
+  /\b(grain of salt|i may be wrong|take this lightly|limited view|for what it'?s worth|when (?:the )?code compiles|when it compiles|need (?:the )?full context|diff is incomplete|we can'?t be sure|n% of the (?:pr|diff)|%\s*of the (?:pr|diff)|trust (?:this|nothing)|epistemic)\b/i;
+
+/**
+ * Drop a trailing paragraph that hedges the review itself. The partial-review
+ * banner already covers coverage honesty; the closer should judge the code.
+ */
+export function stripHedgeCloser(roastText: string): {
+  text: string;
+  stripped: boolean;
+} {
+  const text = (roastText || "").trim();
+  if (!text) return { text, stripped: false };
+
+  const paragraphs = text.split(/\n\s*\n/);
+  if (paragraphs.length < 2) {
+    // Single block: only strip if the last non-empty line alone is a hedge.
+    const lines = text.split(/\r?\n/);
+    let lastIdx = lines.length - 1;
+    while (lastIdx >= 0 && !lines[lastIdx]!.trim()) lastIdx -= 1;
+    if (lastIdx < 0) return { text, stripped: false };
+    const last = lines[lastIdx]!.trim();
+    if (
+      !/^\s*(?:[-*+]|\d+\.)\s+/.test(last) &&
+      !/^#{1,6}\s/.test(last) &&
+      HEDGE_CLOSER_RE.test(last)
+    ) {
+      const kept = lines.slice(0, lastIdx).join("\n").trim();
+      return { text: kept || text, stripped: true };
+    }
+    return { text, stripped: false };
+  }
+
+  const last = paragraphs[paragraphs.length - 1]!.trim();
+  // Don't strip structured sections — only short closer-like paragraphs.
+  if (
+    /^\s*(?:[-*+]|\d+\.)\s+/m.test(last) ||
+    /^#{1,6}\s/m.test(last) ||
+    /^###\s/m.test(last)
+  ) {
+    return { text, stripped: false };
+  }
+  if (!HEDGE_CLOSER_RE.test(last)) return { text, stripped: false };
+
+  const kept = paragraphs.slice(0, -1).join("\n\n").trim();
+  return { text: kept || text, stripped: true };
+}

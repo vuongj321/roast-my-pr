@@ -162,7 +162,7 @@ Output format (GitHub Markdown) — emit ONLY this finished review, never your p
 1. A short, rude one-liner headline that lands because it is accurate.
 2. A "What I'd send back" section with 3–6 bullet points. Cite paths (and line ranges if obvious from the diff).
 3. A "Fix it" section with 2–4 concrete fix suggestions (still blunt, but actionable).
-4. A one-line closer — dismissive, reluctant respect, or both.
+4. A one-line closer — dismissive, reluctant respect, or both about the *code*. Never close by hedging the review itself ("grain of salt", "I may be wrong", "limited view", "for what it's worth", "when it compiles", "need full context", "% of the PR"). The bot already labels partial coverage; you do not.
 
 Do not output step-by-step analysis, constraint checklists, "Analyze the Request", "Mental Scan", or "Drafting the Response". Those stay internal; the reply is the roast only.
 
@@ -173,7 +173,9 @@ Examples of tone (do not copy literally; match the energy):
 - Good: "You catch Exception and log it. That is not handling; that is documenting the crash for later."
 
 Rules:
-- Base claims only on the provided PR title, body, and *current* diff. A prior review (if provided) is a list of hypotheses to re-check — not ground truth.
+- Base claims only on the provided PR title, body, commit subjects, and *current* diff. A prior review (if provided) is a list of hypotheses to re-check — not ground truth.
+- Treat title, body, and commit subjects as stated intent and deliberate tradeoffs. Critique the tradeoff; do not demand the rejected alternative as a "Fix it" (e.g. do not demand dropping Postgres enum values when commits say enums are append-only).
+- Prefer "document leftover / align types" over impossible platform undos.
 - Only repeat a prior finding if the current diff still shows the problem. Prefer new remaining issues over rehashing fixed ones.
 - Do not demand fixes that are already present in the packed diff (e.g. do not insist on wrapping in transactions if the diff already uses them).
 - Do not invent files or behavior that are not in the diff. If context is truncated and you cannot verify a claim, say so bluntly instead of asserting it.
@@ -209,6 +211,8 @@ export type ReviewDeltaInput = {
   commits: number;
   files: string[];
   truncated: boolean;
+  /** First-line subjects for commits in the delta range. */
+  commitMessages?: string[];
 };
 
 export function buildUserPrompt(input: {
@@ -227,6 +231,8 @@ export function buildUserPrompt(input: {
   reviewedSha?: string | null;
   reviewDelta?: ReviewDeltaInput | null;
   partialFiles?: PartialFile[];
+  /** First-line subjects from the PR's commits (stated intent). */
+  commitMessages?: string[];
 }): string {
   const body = input.body?.trim() ? input.body.trim() : "(no description)";
   const coverage =
@@ -247,6 +253,26 @@ export function buildUserPrompt(input: {
           .join(", ")}. Code you cannot see in a partially shown file is NOT evidence that it is missing, unfixed, or unchanged.`
       : "";
 
+  const lowCoverage =
+    input.truncated ||
+    (typeof input.includedFiles === "number" &&
+      typeof input.totalFiles === "number" &&
+      input.totalFiles > 0 &&
+      input.includedFiles / input.totalFiles < PARTIAL_REVIEW_FILE_RATIO);
+  const lowCoverageNote = lowCoverage
+    ? `\n\nLOW COVERAGE RULES (mandatory): Absolute claims about omitted or partially shown files are banned. Prefer "not in the packed slice" over "missing/unfixed/broken". Soften the headline — do not pretend you saw the whole PR. Ban "definitely", "clearly never", and "the compiler will" about code you were not shown.`
+    : "";
+
+  const commits = (input.commitMessages ?? []).filter((m) => m.trim());
+  const commitsSection =
+    commits.length > 0
+      ? `\n\nAuthor commits (stated intent):\n${commits
+          .map((m) => `- ${m}`)
+          .join(
+            "\n",
+          )}\nTreat these as deliberate tradeoffs. Critique the tradeoff; do not demand the rejected alternative as a Fix it.`
+      : "";
+
   const findings = input.priorFindings ?? [];
   const findingsSection =
     findings.length > 0
@@ -256,8 +282,13 @@ export function buildUserPrompt(input: {
       : "";
 
   const delta = input.reviewDelta;
+  const deltaCommits = (delta?.commitMessages ?? []).filter((m) => m.trim());
+  const deltaCommitLines =
+    deltaCommits.length > 0
+      ? `\nDelta commit subjects:\n${deltaCommits.map((m) => `- ${m}`).join("\n")}`
+      : "";
   const deltaSection = delta
-    ? `\n\nChanges pushed since that review (${delta.commits} commit${delta.commits === 1 ? "" : "s"} on top of ${input.reviewedSha?.slice(0, 7) ?? "the reviewed commit"}${delta.truncated ? ", list truncated" : ""}):\n\`\`\`diff\n${delta.diff}\n\`\`\`\nTreat these as the author's fixes: if a prior finding is addressed here, mark it resolved and do not ask for it again. Only complain if the new code itself is broken.`
+    ? `\n\nChanges pushed since that review (${delta.commits} commit${delta.commits === 1 ? "" : "s"} on top of ${input.reviewedSha?.slice(0, 7) ?? "the reviewed commit"}${delta.truncated ? ", list truncated" : ""}):${deltaCommitLines}\n\`\`\`diff\n${delta.diff}\n\`\`\`\nTreat these as the author's fixes: if a prior finding is addressed here, mark it resolved and do not ask for it again. Only complain if the new code itself is broken.`
     : "";
 
   const prior = input.priorRoast?.trim()
@@ -281,17 +312,24 @@ Author: @${input.author}
 Title: ${input.title}${coverage}
 
 Description:
-${body}
+${body}${commitsSection}
 
 Diff:
 \`\`\`diff
 ${input.diff}
 \`\`\`
-${truncationNote}${partialNote}${deltaSection}${findingsSection}${priorSection}`;
+${truncationNote}${partialNote}${lowCoverageNote}${deltaSection}${findingsSection}${priorSection}`;
 }
 
 /** Below this share of changed files, the roast is labelled a partial review. */
 export const PARTIAL_REVIEW_FILE_RATIO = 0.5;
+
+export type PartialReviewNoteOptions = {
+  /** Winning provider name (gemini / groq / workersai). */
+  provider?: string;
+  /** True when packing dropped files or hunks. */
+  truncated?: boolean;
+};
 
 /**
  * Visible banner for runs where the provider budget only covered a fraction of
@@ -299,13 +337,26 @@ export const PARTIAL_REVIEW_FILE_RATIO = 0.5;
  */
 export function buildPartialReviewNote(
   coverage: PackCoverage,
+  options: PartialReviewNoteOptions = {},
 ): string | null {
   const { includedFiles, totalFiles, shownChars, totalChars } = coverage;
   if (totalFiles < 8) return null;
-  if (includedFiles > 0 && includedFiles / totalFiles >= PARTIAL_REVIEW_FILE_RATIO) {
-    return null;
-  }
+
+  const fileRatioThin =
+    includedFiles === 0 || includedFiles / totalFiles < PARTIAL_REVIEW_FILE_RATIO;
+  const charTruncated =
+    options.truncated === true ||
+    (totalChars > 0 && shownChars < totalChars);
+  if (!fileRatioThin && !charTruncated) return null;
+
   const pct = totalChars > 0 ? Math.round((shownChars / totalChars) * 100) : 0;
+  const provider = (options.provider || "").toLowerCase();
+  const isFallback = provider !== "" && provider !== "gemini";
+
+  if (isFallback) {
+    return `_Partial review via fallback model (\`${provider}\`): only ${includedFiles} of ${totalFiles} changed files fitted the provider's budget (~${pct}% of the diff text). Claims outside the packed slice are unverified._`;
+  }
+
   return `_Partial review: only ${includedFiles} of ${totalFiles} changed files fitted the provider's budget (~${pct}% of the diff text). Anything about the files that were not shown is missing by construction, not by design._`;
 }
 

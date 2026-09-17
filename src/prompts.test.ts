@@ -71,6 +71,30 @@ describe("buildUserPrompt", () => {
     assert.match(prompt, /prior roast truncated/);
     assert.ok(!prompt.includes(prior));
   });
+
+  it("includes author commit subjects as stated intent", () => {
+    const prompt = buildUserPrompt({
+      ...basePromptInput,
+      commitMessages: [
+        "refactor: drop dead queues",
+        "chore(db): keep unused enum values — Postgres cannot drop them",
+      ],
+    });
+    assert.match(prompt, /Author commits \(stated intent\)/);
+    assert.match(prompt, /Postgres cannot drop them/);
+    assert.match(prompt, /deliberate tradeoffs/);
+  });
+
+  it("adds low-coverage claim discipline when the pack is truncated", () => {
+    const prompt = buildUserPrompt({
+      ...basePromptInput,
+      truncated: true,
+      includedFiles: 5,
+      totalFiles: 48,
+    });
+    assert.match(prompt, /LOW COVERAGE RULES/);
+    assert.match(prompt, /not in the packed slice/);
+  });
 });
 
 describe("ROAST_SYSTEM_PROMPT", () => {
@@ -87,6 +111,13 @@ describe("ROAST_SYSTEM_PROMPT", () => {
       ROAST_SYSTEM_PROMPT,
       /Never raise a finding you yourself marked resolved/,
     );
+  });
+
+  it("treats commit subjects as intent and bans hedge closers", () => {
+    assert.match(ROAST_SYSTEM_PROMPT, /commit subjects as stated intent/);
+    assert.match(ROAST_SYSTEM_PROMPT, /append-only/);
+    assert.match(ROAST_SYSTEM_PROMPT, /grain of salt/);
+    assert.match(ROAST_SYSTEM_PROMPT, /document leftover/);
   });
 });
 
@@ -230,7 +261,7 @@ describe("truncatePriorRoast tail", () => {
 });
 
 describe("buildPartialReviewNote", () => {
-  it("is silent for small PRs and healthy coverage", () => {
+  it("is silent for small PRs and healthy full coverage", () => {
     assert.equal(
       buildPartialReviewNote({
         includedFiles: 2,
@@ -244,7 +275,7 @@ describe("buildPartialReviewNote", () => {
       buildPartialReviewNote({
         includedFiles: 18,
         totalFiles: 25,
-        shownChars: 45_000,
+        shownChars: 71_000,
         totalChars: 71_000,
       }),
       null,
@@ -262,6 +293,35 @@ describe("buildPartialReviewNote", () => {
     assert.ok(note);
     assert.match(note!, /6 of 25 changed files/);
     assert.match(note!, /~10% of the diff text/);
+  });
+
+  it("banners truncated packs even when file ratio looks healthy", () => {
+    const note = buildPartialReviewNote(
+      {
+        includedFiles: 18,
+        totalFiles: 25,
+        shownChars: 45_000,
+        totalChars: 71_000,
+      },
+      { truncated: true },
+    );
+    assert.ok(note);
+    assert.match(note!, /18 of 25 changed files/);
+  });
+
+  it("uses a louder banner for non-Gemini fallbacks", () => {
+    const note = buildPartialReviewNote(
+      {
+        includedFiles: 6,
+        totalFiles: 25,
+        shownChars: 7_000,
+        totalChars: 71_000,
+      },
+      { provider: "groq" },
+    );
+    assert.ok(note);
+    assert.match(note!, /fallback model \(`groq`\)/);
+    assert.match(note!, /Claims outside the packed slice are unverified/);
   });
 });
 

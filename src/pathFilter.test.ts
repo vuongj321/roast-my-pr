@@ -8,6 +8,7 @@ import {
   dropResolvedRepeats,
   filterRoastByPackedPaths,
   parseFindingAccounting,
+  stripHedgeCloser,
 } from "./pathFilter.js";
 import type { FindingStatus, PriorFinding } from "./types.js";
 
@@ -198,5 +199,35 @@ describe("dropResolvedRepeats", () => {
       ).dropped,
       0,
     );
+  });
+});
+
+describe("stripHedgeCloser", () => {
+  it("removes a trailing hedge paragraph", () => {
+    const roast = `Half-baked cleanup.
+
+### What I'd send back
+- Real bug in \`apps/api/src/config/env.ts\`
+
+### Fix it
+- Align the type with the returned object.
+
+I'll take a pass when the code compiles and we need full context.`;
+    const { text, stripped } = stripHedgeCloser(roast);
+    assert.equal(stripped, true);
+    assert.doesNotMatch(text, /when the code compiles/);
+    assert.match(text, /Align the type/);
+  });
+
+  it("keeps a closer that judges the code", () => {
+    const roast = `Messy diff.
+
+### Fix it
+- Delete the orphan.
+
+Ship it when the tests pass, not before.`;
+    const { text, stripped } = stripHedgeCloser(roast);
+    assert.equal(stripped, false);
+    assert.match(text, /Ship it when the tests pass/);
   });
 });

@@ -7,7 +7,7 @@ import {
   type PackOptions,
   type ProviderName,
 } from "./diffPack.js";
-import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting } from "./pathFilter.js";
+import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting, stripHedgeCloser } from "./pathFilter.js";
 import {
   buildPartialReviewNote,
   buildUserPrompt,
@@ -58,6 +58,10 @@ export type RoastInput = {
   /** Files changed between reviewedSha and the current head. */
   deltaFiles?: DiffFile[];
   deltaCommits?: number;
+  /** First-line subjects for commits in the delta range. */
+  deltaCommitMessages?: string[];
+  /** First-line subjects from the PR's commits (stated intent). */
+  commitMessages?: string[];
 };
 
 type ProviderFailure = {
@@ -230,6 +234,7 @@ function buildPackedPrompt(input: RoastInput, budget: PackOptions): PackedPrompt
       includedFiles: packed.includedFiles,
       totalFiles: packed.totalFiles,
       partialFiles: packed.partialFiles,
+      commitMessages: input.commitMessages,
       priorRoast: input.priorRoast,
       priorFindings: input.priorFindings,
       reviewedSha: input.reviewedSha,
@@ -239,6 +244,7 @@ function buildPackedPrompt(input: RoastInput, budget: PackOptions): PackedPrompt
             commits: input.deltaCommits ?? 0,
             files: delta.includedFilenames,
             truncated: delta.truncated,
+            commitMessages: input.deltaCommitMessages,
           }
         : null,
     }),
@@ -608,7 +614,8 @@ export async function generateRoast(
 
   for (const attempt of configured) {
     try {
-      const { text, includedFilenames, coverage } = await attempt.run();
+      const { text, includedFilenames, coverage, truncated } =
+        await attempt.run();
       if (!text.trim()) {
         failures.push({
           provider: attempt.name,
@@ -647,7 +654,12 @@ export async function generateRoast(
         );
       }
 
-      const coverageNote = buildPartialReviewNote(coverage);
+      const dehedged = stripHedgeCloser(deduped.text);
+
+      const coverageNote = buildPartialReviewNote(coverage, {
+        provider: attempt.name,
+        truncated,
+      });
       if (coverageNote) {
         console.error(
           `Roast coverage (${attempt.name}): ${coverage.includedFiles}/${coverage.totalFiles} files, ${coverage.shownChars}/${coverage.totalChars} patch chars — labelled partial`,
@@ -655,7 +667,9 @@ export async function generateRoast(
       }
 
       return {
-        text: coverageNote ? `${coverageNote}\n\n${deduped.text}` : deduped.text,
+        text: coverageNote
+          ? `${coverageNote}\n\n${dehedged.text}`
+          : dehedged.text,
         provider: attempt.name,
         model: attempt.model,
         coverage,

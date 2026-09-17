@@ -120,6 +120,39 @@ export interface PullContext {
   headSha?: string;
   /** Base commit SHA of the PR. */
   baseSha?: string;
+  /** First-line subjects from PR commits (stated intent / tradeoffs). */
+  commitMessages: string[];
+}
+
+/** Cap how many commit subjects enter the roast prompt. */
+export const MAX_COMMIT_MESSAGES = 12;
+
+/** Cap length of each commit subject line. */
+export const MAX_COMMIT_SUBJECT_CHARS = 160;
+
+/** First line of a commit message, clipped for the prompt. */
+export function truncateCommitSubject(
+  message: string,
+  maxChars = MAX_COMMIT_SUBJECT_CHARS,
+): string {
+  const firstLine = (message || "").split(/\r?\n/)[0]?.trim() || "";
+  if (!firstLine) return "";
+  if (firstLine.length <= maxChars) return firstLine;
+  return `${firstLine.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+/** Normalize raw commit messages into capped subject lines. */
+export function commitSubjectsFromMessages(
+  messages: readonly (string | null | undefined)[],
+  maxMessages = MAX_COMMIT_MESSAGES,
+): string[] {
+  const out: string[] = [];
+  for (const raw of messages) {
+    if (out.length >= maxMessages) break;
+    const subject = truncateCommitSubject(raw || "");
+    if (subject) out.push(subject);
+  }
+  return out;
 }
 
 /**
@@ -166,6 +199,13 @@ export async function fetchPullContext(
     }
   }
 
+  const commitMessages = await fetchPullCommitSubjects(
+    octokit,
+    owner,
+    repo,
+    pullNumber,
+  );
+
   return {
     title: pr.title || "(untitled)",
     body: pr.body || "",
@@ -174,7 +214,31 @@ export async function fetchPullContext(
     filesIncomplete,
     headSha: pr.head?.sha,
     baseSha: pr.base?.sha,
+    commitMessages,
   };
+}
+
+/** First-line subjects from `pulls.listCommits` (capped). */
+export async function fetchPullCommitSubjects(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+): Promise<string[]> {
+  try {
+    const { data } = await octokit.rest.pulls.listCommits({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: MAX_COMMIT_MESSAGES,
+    });
+    return commitSubjectsFromMessages(
+      data.map((c) => c.commit?.message),
+    );
+  } catch (err) {
+    console.error("PR commit list unavailable", formatGithubError(err));
+    return [];
+  }
 }
 
 /** GitHub caps a single comparison at 300 files. */
@@ -183,6 +247,8 @@ const MAX_COMPARE_FILES = 300;
 export type ReviewDelta = {
   files: DiffFile[];
   commits: number;
+  /** First-line subjects for commits in the compare range. */
+  commitMessages: string[];
   /** True when the comparison hit GitHub's 300-file cap. */
   truncated: boolean;
   /** True when a SHA is gone (force-push) or the comparison failed. */
@@ -206,6 +272,7 @@ export async function fetchReviewDelta(
   const empty: ReviewDelta = {
     files: [],
     commits: 0,
+    commitMessages: [],
     truncated: false,
     unavailable: true,
   };
@@ -226,6 +293,9 @@ export async function fetchReviewDelta(
     return {
       files,
       commits: data.commits?.length ?? 0,
+      commitMessages: commitSubjectsFromMessages(
+        (data.commits ?? []).map((c) => c.commit?.message),
+      ),
       truncated: entries.length > MAX_COMPARE_FILES,
       unavailable: false,
     };

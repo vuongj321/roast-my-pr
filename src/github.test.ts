@@ -4,6 +4,10 @@ import {
   isRoastBotComment,
   selectLatestPriorRoast,
   selectLatestPriorRoastComment,
+  truncateCommitSubject,
+  commitSubjectsFromMessages,
+  MAX_COMMIT_MESSAGES,
+  MAX_COMMIT_SUBJECT_CHARS,
 } from "./github.js";
 import { ROAST_FOOTER_MARKER, buildRoastFooter, readRoastState } from "./prompts.js";
 import type { RoastState } from "./types.js";
@@ -93,5 +97,28 @@ describe("selectLatestPriorRoast (deprecated wrapper)", () => {
       ),
       roast.trim(),
     );
+  });
+});
+
+describe("commitSubjectsFromMessages", () => {
+  it("keeps the first line and clips long subjects", () => {
+    assert.equal(
+      truncateCommitSubject("feat: add widgets\n\nLong body here"),
+      "feat: add widgets",
+    );
+    const long = `x${"y".repeat(MAX_COMMIT_SUBJECT_CHARS)}`;
+    const clipped = truncateCommitSubject(long);
+    assert.ok(clipped.length <= MAX_COMMIT_SUBJECT_CHARS);
+    assert.match(clipped, /…$/);
+  });
+
+  it("caps how many subjects are kept", () => {
+    const messages = Array.from(
+      { length: MAX_COMMIT_MESSAGES + 5 },
+      (_, i) => `commit ${i}`,
+    );
+    const subjects = commitSubjectsFromMessages(messages);
+    assert.equal(subjects.length, MAX_COMMIT_MESSAGES);
+    assert.equal(subjects[0], "commit 0");
   });
 });

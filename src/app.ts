@@ -124,11 +124,13 @@ export async function handleIssueComment(
       author: pull.author,
       files: pull.files,
       filesIncomplete: pull.filesIncomplete,
+      commitMessages: pull.commitMessages,
       priorRoast,
       priorFindings,
       reviewedSha: priorState?.sha ?? null,
       deltaFiles: delta?.files,
       deltaCommits: delta?.commits,
+      deltaCommitMessages: delta?.commitMessages,
     });
 
     console.error(
