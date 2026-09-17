@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   extractCitedPaths,
   filePriority,
+  isHighSignalPath,
   isNoiseFile,
   matchesPriorityPath,
   packPullContext,
@@ -25,6 +26,19 @@ describe("filePriority", () => {
     assert.ok(filePriority("src/app.ts") < filePriority("README.md"));
     assert.ok(filePriority("src/app.ts") < filePriority("src/app.test.ts"));
     assert.ok(filePriority("src/app.ts") < filePriority("package-lock.json"));
+  });
+});
+
+describe("isHighSignalPath", () => {
+  it("flags env, schema, controllers, and package.json", () => {
+    assert.equal(isHighSignalPath("apps/api/src/config/env.ts"), true);
+    assert.equal(isHighSignalPath("apps/api/src/db/schema.ts"), true);
+    assert.equal(
+      isHighSignalPath("apps/api/src/billing/billing.controller.ts"),
+      true,
+    );
+    assert.equal(isHighSignalPath("package.json"), true);
+    assert.equal(isHighSignalPath("src/app.ts"), false);
   });
 });
 
@@ -150,6 +164,51 @@ describe("packPullContext", () => {
     const aIdx = packed.diff.indexOf("src/a.ts");
     assert.ok(orgIdx >= 0);
     if (aIdx >= 0) assert.ok(orgIdx < aIdx);
+  });
+
+  it("packs deleted high-signal files before same-tier small touches", () => {
+    const files = [
+      {
+        filename: "src/util.ts",
+        status: "modified",
+        patch: "@@\n+const x = 1;\n",
+      },
+      {
+        filename: "apps/api/src/config/env.ts",
+        status: "removed",
+        patch: "@@\n-export const STRIPE_SECRET_KEY = \"\";\n",
+      },
+      {
+        filename: "apps/api/src/billing/billing.controller.ts",
+        status: "removed",
+        patch: "@@\n-@Post('checkout')\n-checkout() {}\n",
+      },
+      {
+        filename: "src/tiny.ts",
+        status: "modified",
+        patch: "@@\n+noop\n",
+      },
+    ];
+
+    const packed = packPullContext(files, "body", {
+      maxTotalChars: 1_400,
+      maxPerFileChars: 600,
+      maxBodyChars: 100,
+    });
+
+    const envIdx = packed.diff.indexOf("config/env.ts");
+    const ctrlIdx = packed.diff.indexOf("billing.controller.ts");
+    const utilIdx = packed.diff.indexOf("src/util.ts");
+    assert.ok(envIdx >= 0);
+    assert.ok(ctrlIdx >= 0);
+    assert.ok(envIdx < utilIdx || utilIdx < 0);
+    assert.ok(ctrlIdx < utilIdx || utilIdx < 0);
+    assert.ok(packed.includedFilenames.includes("apps/api/src/config/env.ts"));
+    assert.ok(
+      packed.includedFilenames.includes(
+        "apps/api/src/billing/billing.controller.ts",
+      ),
+    );
   });
 });
 

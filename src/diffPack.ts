@@ -105,6 +105,25 @@ export function filePriority(filename: string): number {
   return 20;
 }
 
+/**
+ * Paths that tend to carry orphan-ref / wiring bugs in cleanup PRs
+ * (env, schema, controllers, package manifests).
+ */
+export function isHighSignalPath(filename: string): boolean {
+  const base = filename.split("/").pop() || filename;
+  if (/^package\.json$/i.test(base)) return true;
+  if (/^(env|schema)(\.[a-z0-9]+)+$/i.test(base)) return true;
+  if (/controller/i.test(base)) return true;
+  return false;
+}
+
+/** Within a priority tier: removals before renames before everything else. */
+function statusRank(status: string): number {
+  if (status === "removed") return 0;
+  if (status === "renamed") return 1;
+  return 2;
+}
+
 const PATH_EXT =
   /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|swift|rb|php|cs|c|cpp|h|hpp|vue|svelte|json|ya?ml|toml|md|sql)$/i;
 
@@ -376,7 +395,15 @@ export function packPullContext(
         ? 0
         : filePriority(file.filename),
     }))
-    .sort((a, b) => a.priority - b.priority || a.index - b.index);
+    .sort(
+      (a, b) =>
+        a.priority - b.priority ||
+        statusRank(a.file.status) - statusRank(b.file.status) ||
+        (isHighSignalPath(a.file.filename) ? 0 : 1) -
+          (isHighSignalPath(b.file.filename) ? 0 : 1) ||
+        (b.file.patch?.length ?? 0) - (a.file.patch?.length ?? 0) ||
+        a.index - b.index,
+    );
 
   const recordCoverage = (block: FileBlock) => {
     used += block.block.length;
