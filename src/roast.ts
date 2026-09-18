@@ -15,9 +15,11 @@ import {
 } from "./prompts.js";
 import {
   extractModelText,
+  isPlanningDump,
   isTruncatedRoastText,
   isUsableRoastText,
-  logEmptyCompletionPayload,
+  logRejectedAnswer,
+  rawAnswerText,
 } from "./responseText.js";
 import type { PackCoverage, PriorFinding } from "./types.js";
 
@@ -85,6 +87,12 @@ interface OpenAIChatResponse {
   choices?: Array<{
     message?: { content?: string | null };
   }>;
+  /** Present on OpenAI (and most compatible gateways) for cost auditing. */
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
   error?: { message?: string; type?: string; code?: string | number };
 }
 
@@ -265,19 +273,127 @@ function workersAiModel(env: Env): string {
   return env.WORKERS_AI_MODEL || "@cf/google/gemma-4-26b-a4b-it";
 }
 
+/** Paid provider base URL; override for any OpenAI-shaped gateway. */
+function openaiBaseUrl(env: Env): string {
+  const raw = (env.OPENAI_BASE_URL || "").trim() || "https://api.openai.com/v1";
+  return raw.replace(/\/+$/, "");
+}
+
+/**
+ * Which body field carries the output cap. OpenAI's reasoning models expect
+ * `max_completion_tokens`; some compatible gateways still want `max_tokens`.
+ */
+function openaiMaxTokensField(
+  env: Env,
+): "max_tokens" | "max_completion_tokens" | "omit" {
+  const raw = (env.OPENAI_MAX_TOKENS_FIELD || "").trim().toLowerCase();
+  if (raw === "max_tokens" || raw === "omit") return raw;
+  return "max_completion_tokens";
+}
+
+/** The paid provider runs only when both halves of its config are present. */
+function isOpenAiEnabled(env: Env): boolean {
+  return Boolean(env.OPENAI_API_KEY && env.OPENAI_MODEL);
+}
+
+/** Enablement rules, shared by the attempt builders and `enabledProviders`. */
+const PROVIDER_ENABLED: Record<ProviderName, (env: Env) => boolean> = {
+  openai: isOpenAiEnabled,
+  gemini: (env) => Boolean(env.GEMINI_API_KEY),
+  workersai: (env) => Boolean(env.AI),
+  groq: (env) => Boolean(env.GROQ_API_KEY),
+};
+
+/** Provider priority: optional paid endpoint first, then the free tiers. */
+export const PROVIDER_PRIORITY: readonly ProviderName[] = [
+  "openai",
+  "gemini",
+  "workersai",
+  "groq",
+];
+
+/** Providers this env can actually call, in priority order. */
+export function enabledProviders(env: Env): ProviderName[] {
+  return PROVIDER_PRIORITY.filter((name) => PROVIDER_ENABLED[name](env));
+}
+
+/**
+ * A half-configured paid provider is a silent no-op, so say it out loud rather
+ * than quietly reviewing with the free tier.
+ */
+export function providerConfigWarnings(env: Env): string[] {
+  const warnings: string[] = [];
+  if (env.OPENAI_API_KEY && !env.OPENAI_MODEL) {
+    warnings.push(
+      "OPENAI_API_KEY is set but OPENAI_MODEL is missing — paid provider skipped. Set OPENAI_MODEL (e.g. gpt-5.6-terra) or remove the key.",
+    );
+  }
+  if (env.OPENAI_MODEL && !env.OPENAI_API_KEY) {
+    warnings.push(
+      "OPENAI_MODEL is set but OPENAI_API_KEY is missing — paid provider skipped.",
+    );
+  }
+  return warnings;
+}
+
 export type RoastResult = {
   text: string;
   provider: ProviderName;
   model: string;
   /** How much of the PR this run actually saw (written to the footer). */
   coverage: PackCoverage;
+  /**
+   * Visible partial-coverage note for the footer, or null when the run saw
+   * everything. Kept out of `text` so the roast body stays the model's answer.
+   */
+  partialNote: string | null;
 };
+
+/** Hard ceiling for one outbound provider request, so a stall cannot hold the webhook open. */
+export const LLM_TIMEOUT_MS = 30_000;
+
+function formatDuration(ms: number): string {
+  return ms >= 1_000 ? `${Math.round(ms / 1_000)}s` : `${ms}ms`;
+}
+
+/**
+ * POST to a provider with a deadline. The roast runs inline in the webhook, so a
+ * provider that stops answering costs the whole comment — not just its own turn
+ * — while the next provider in the chain would have answered. A timeout is never
+ * "quota-like", so the chain keeps walking instead of reporting a rate limit.
+ */
+export async function fetchWithTimeout(
+  provider: string,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number = LLM_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    const aborted = err instanceof Error && err.name === "AbortError";
+    const message = aborted
+      ? `${provider} did not answer within ${formatDuration(timeoutMs)}.`
+      : err instanceof Error
+        ? err.message
+        : `${provider} request failed.`;
+    throw Object.assign(new Error(message), {
+      quotaLike: false,
+      tooLarge: false,
+      emptyCompletion: false,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function callGemini(env: Env, userPrompt: string): Promise<string> {
   const model = geminiModel(env);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout("Gemini", url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -334,10 +450,20 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
     truncatedByApi ||
     isTruncatedRoastText(text)
   ) {
-    logEmptyCompletionPayload("Gemini", data);
+    const truncated = truncatedByApi || isTruncatedRoastText(text);
+    logRejectedAnswer(
+      "Gemini",
+      truncated
+        ? "returned a truncated roast"
+        : isPlanningDump(text)
+          ? "returned planning notes, not a roast"
+          : "returned an empty roast",
+      text,
+      data,
+    );
     throw Object.assign(
       new Error(
-        truncatedByApi || isTruncatedRoastText(text)
+        truncated
           ? "Gemini returned a truncated roast."
           : "Gemini returned an empty roast.",
       ),
@@ -348,60 +474,234 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
   return text;
 }
 
-async function callOpenAICompatible(options: {
+/** Paid runs should be auditable: log token spend whenever a provider reports it. */
+function logOpenAiUsage(provider: string, data: OpenAIChatResponse): void {
+  const usage = data.usage;
+  if (!usage) return;
+  const parts = [
+    typeof usage.prompt_tokens === "number"
+      ? `prompt=${usage.prompt_tokens}`
+      : null,
+    typeof usage.completion_tokens === "number"
+      ? `completion=${usage.completion_tokens}`
+      : null,
+    typeof usage.total_tokens === "number" ? `total=${usage.total_tokens}` : null,
+  ].filter((part): part is string => Boolean(part));
+  if (parts.length > 0) {
+    console.error(`Roast ${provider} usage: ${parts.join(" ")} tokens`);
+  }
+}
+
+/**
+ * Distinguish "the model answered with its scratchpad" from "the model answered
+ * with nothing". Only the latter is worth a 50%-budget retry — and on the paid
+ * provider, a second invoice.
+ */
+function unusableOutputError(provider: string, data: unknown): Error {
+  const planning = isPlanningDump(rawAnswerText(data));
+  return Object.assign(
+    new Error(
+      planning
+        ? `${provider} returned its planning notes, not a roast.`
+        : `${provider} returned an empty roast.`,
+    ),
+    {
+      quotaLike: false,
+      tooLarge: false,
+      emptyCompletion: !planning,
+      planningDump: planning,
+    },
+  );
+}
+
+/** The body fields a gateway can refuse, most featureful first. */
+type OpenAiBodyShape = {
+  maxTokensField: "max_tokens" | "max_completion_tokens" | "omit";
+  temperature: boolean;
+  extraBody?: Record<string, unknown>;
+};
+
+/**
+ * Bodies to try for one paid call: the configured shape, the same thing without
+ * our extra fields, then a bare `model` + `messages` request.
+ *
+ * A gateway can 400 on any field we added — `reasoning_effort` on a
+ * non-reasoning model, `max_completion_tokens` on an older or narrower gateway,
+ * a non-default `temperature` on a reasoning model — and each of those would
+ * otherwise drop the paid provider out of the chain for a whole roast. The
+ * plainer request is what every OpenAI-compatible vendor documents as supported.
+ * Identical bodies collapse, so an unconfigured paid call still sends one request.
+ */
+function paidRequestBodies(options: {
+  model: string;
+  userPrompt: string;
+  maxTokens?: number;
+  maxTokensField?: "max_tokens" | "max_completion_tokens" | "omit";
+  omitTemperature?: boolean;
+  extraBody?: Record<string, unknown>;
+}): Record<string, unknown>[] {
+  const capField = options.maxTokensField ?? "max_tokens";
+  const shapes: OpenAiBodyShape[] = [
+    {
+      maxTokensField: capField,
+      temperature: !options.omitTemperature,
+      extraBody: options.extraBody,
+    },
+    { maxTokensField: capField, temperature: !options.omitTemperature },
+    { maxTokensField: "omit", temperature: false },
+  ];
+
+  const bodies: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const shape of shapes) {
+    const body: Record<string, unknown> = {
+      model: options.model,
+      ...(shape.temperature ? { temperature: 0.9 } : {}),
+      ...(shape.maxTokensField === "omit"
+        ? {}
+        : { [shape.maxTokensField]: options.maxTokens ?? 2048 }),
+      messages: [
+        { role: "system", content: ROAST_SYSTEM_PROMPT },
+        { role: "user", content: options.userPrompt },
+      ],
+      ...shape.extraBody,
+    };
+    const key = JSON.stringify(body);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    bodies.push(body);
+  }
+  return bodies;
+}
+
+export async function callOpenAICompatible(options: {
   provider: string;
   url: string;
   apiKey: string;
   model: string;
   userPrompt: string;
   maxTokens?: number;
+  /**
+   * Which body field carries the output cap. Defaults to `max_tokens` (Groq);
+   * OpenAI's reasoning models expect `max_completion_tokens`.
+   */
+  maxTokensField?: "max_tokens" | "max_completion_tokens" | "omit";
+  /**
+   * Reasoning models reject a non-default temperature. The paid caller omits it
+   * when the operator declared a reasoning model via `OPENAI_REASONING_EFFORT`.
+   */
+  omitTemperature?: boolean;
   extraHeaders?: Record<string, string>;
   /** Extra OpenAI-compatible body fields (e.g. Groq reasoning controls). */
   extraBody?: Record<string, unknown>;
 }): Promise<string> {
-  const res = await fetch(options.url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${options.apiKey}`,
-      ...options.extraHeaders,
-    },
-    body: JSON.stringify({
-      model: options.model,
-      temperature: 0.9,
-      max_tokens: options.maxTokens ?? 2048,
-      messages: [
-        { role: "system", content: ROAST_SYSTEM_PROMPT },
-        { role: "user", content: options.userPrompt },
-      ],
-      ...options.extraBody,
-    }),
-  });
+  const bodies = paidRequestBodies(options);
+  let refusedField: Error | undefined;
 
-  const data = (await res.json()) as OpenAIChatResponse;
-
-  if (!res.ok) {
-    const message =
-      data.error?.message || `${options.provider} HTTP ${res.status}`;
-    const quotaLike =
-      isRetryableStatus(res.status) || isQuotaLikeMessage(message);
-    throw Object.assign(new Error(message), {
-      quotaLike,
-      tooLarge: isPromptTooLargeMessage(message),
-      emptyCompletion: false,
+  for (let index = 0; index < bodies.length; index += 1) {
+    const res = await fetchWithTimeout(options.provider, options.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${options.apiKey}`,
+        ...options.extraHeaders,
+      },
+      body: JSON.stringify(bodies[index]),
     });
+
+    const data = (await res.json()) as OpenAIChatResponse;
+    // Logged before the error checks: a failed call still burns tokens, which
+    // matters most on the paid provider.
+    logOpenAiUsage(options.provider, data);
+
+    if (!res.ok) {
+      const message =
+        data.error?.message || `${options.provider} HTTP ${res.status}`;
+      const error = Object.assign(new Error(message), {
+        quotaLike: isRetryableStatus(res.status) || isQuotaLikeMessage(message),
+        tooLarge: isPromptTooLargeMessage(message),
+        emptyCompletion: false,
+      });
+      // A refused field says nothing about the roast: shed ours, ask again with
+      // the plainer body, and keep the paid provider in the chain.
+      if (index < bodies.length - 1 && isUnsupportedParameterError(error)) {
+        refusedField = error;
+        console.error(
+          `Roast provider ${options.provider}: gateway refused a request field (${message}) — retrying with a plainer body`,
+        );
+        continue;
+      }
+      throw error;
+    }
+
+    const text = extractModelText(data);
+    if (!text) {
+      const answer = rawAnswerText(data);
+      logRejectedAnswer(
+        options.provider,
+        isPlanningDump(answer)
+          ? "returned planning notes, not a roast"
+          : "returned an empty roast",
+        answer,
+        data,
+      );
+      throw unusableOutputError(options.provider, data);
+    }
+
+    return text;
   }
 
-  const text = extractModelText(data);
-  if (!text) {
-    logEmptyCompletionPayload(options.provider, data);
-    throw Object.assign(
-      new Error(`${options.provider} returned an empty roast.`),
-      { quotaLike: false, tooLarge: false, emptyCompletion: true },
+  throw (
+    refusedField ??
+    new Error(`${options.provider} failed with every request shape.`)
+  );
+}
+
+/**
+ * Reasoning families on Workers AI write a plan before the roast. Gemma did
+ * exactly that on PR #4: the planning text landed in the answer field and got
+ * posted as the review. GLM and Gemma default thinking on, so turn it off.
+ */
+function workersAiThinkingControl(model: string): Record<string, unknown> {
+  return /glm|gemma|qwen/i.test(model) ? { thinking: { type: "disabled" } } : {};
+}
+
+/** Chat-template controls are per-model; drop ours if this model rejects it. */
+function isUnsupportedParameterError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return /unsupported|not supported|unknown (?:field|parameter)|unrecognized|invalid (?:field|parameter)|extra (?:inputs|fields)/i.test(
+    message,
+  );
+}
+
+/**
+ * Run a Workers AI model, retrying once without the thinking control when the
+ * model does not accept it — a rejected control must not drop the provider out
+ * of the chain.
+ */
+async function runWorkersAi(
+  env: Env,
+  model: string,
+  inputs: Record<string, unknown>,
+): Promise<unknown> {
+  try {
+    return await env.AI!.run(
+      model as Parameters<Ai["run"]>[0],
+      inputs as Parameters<Ai["run"]>[1],
     );
+  } catch (err) {
+    if ("thinking" in inputs && isUnsupportedParameterError(err)) {
+      const { thinking: _thinking, ...withoutControl } = inputs;
+      console.error(
+        `Roast Workers AI: ${model} rejected the thinking control, retrying without it`,
+      );
+      return await env.AI!.run(
+        model as Parameters<Ai["run"]>[0],
+        withoutControl as Parameters<Ai["run"]>[1],
+      );
+    }
+    throw err;
   }
-
-  return text;
 }
 
 async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
@@ -422,25 +722,23 @@ async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
       ],
       max_tokens: 2048,
       temperature: 0.9,
+      ...workersAiThinkingControl(model),
     };
-    // GLM defaults thinking on; disable when using that family.
-    if (/glm/i.test(model)) {
-      inputs.thinking = { type: "disabled" };
-    }
 
-    const raw = await env.AI.run(
-      model as Parameters<Ai["run"]>[0],
-      inputs as Parameters<Ai["run"]>[1],
-    );
+    const raw = await runWorkersAi(env, model, inputs);
 
     const text = extractModelText(raw);
     if (!text) {
-      logEmptyCompletionPayload("Workers AI", raw);
-      throw Object.assign(new Error("Workers AI returned an empty roast."), {
-        quotaLike: false,
-        tooLarge: false,
-        emptyCompletion: true,
-      });
+      const answer = rawAnswerText(raw);
+      logRejectedAnswer(
+        "Workers AI",
+        isPlanningDump(answer)
+          ? "returned planning notes, not a roast"
+          : "returned an empty roast",
+        answer,
+        raw,
+      );
+      throw unusableOutputError("Workers AI", raw);
     }
     return text;
   } catch (err) {
@@ -493,6 +791,15 @@ function isEmptyCompletionError(err: unknown): boolean {
   return false;
 }
 
+/** A planning dump is not a size problem, so shrinking the pack cannot help. */
+function isPlanningDumpError(err: unknown): boolean {
+  if (typeof err === "object" && err !== null && "planningDump" in err) {
+    return Boolean((err as { planningDump?: boolean }).planningDump);
+  }
+  if (err instanceof Error) return /planning notes/i.test(err.message);
+  return false;
+}
+
 /**
  * Call a provider; on prompt-too-large or empty completion, shrink and retry once.
  * Returns roast text plus the packed filenames used for path filtering.
@@ -514,9 +821,12 @@ async function runWithShrinkRetry(
     } catch (err) {
       lastErr = err;
       // Groq free tier is 8k TPM: an empty→shrink retry often rate-limits the
-      // second call. Only shrink there on explicit "too large" errors.
+      // second call. Only shrink there on explicit "too large" errors. A dump of
+      // planning notes is not about prompt size either, so it never shrinks.
       const emptyOkToShrink =
-        isEmptyCompletionError(err) && provider !== "groq";
+        isEmptyCompletionError(err) &&
+        !isPlanningDumpError(err) &&
+        provider !== "groq";
       const shouldShrink =
         attempt === 0 && (isTooLargeError(err) || emptyOkToShrink);
       if (shouldShrink) {
@@ -539,7 +849,8 @@ async function runWithShrinkRetry(
 }
 
 /**
- * Generate a roast via Gemini, falling back to Workers AI then Groq on failure.
+ * Generate a roast through the provider chain, in PROVIDER_PRIORITY order: the
+ * optional paid OpenAI-compatible endpoint first, then Gemini, Workers AI, Groq.
  * Each provider gets a budget-sized pack of the same PR files (not one shared megaprompt).
  * Groq is last: its 6k pack + weak instruction-following invents claims on thin slices.
  */
@@ -549,16 +860,46 @@ export async function generateRoast(
 ): Promise<RoastResult> {
   const failures: ProviderFailure[] = [];
 
-  const attempts: Array<{
-    name: ProviderName;
-    model: string;
-    enabled: boolean;
-    run: () => Promise<PackedPrompt & { text: string }>;
-  }> = [
-    {
-      name: "gemini",
+  for (const warning of providerConfigWarnings(env)) {
+    console.error(warning);
+  }
+
+  /**
+   * Per-provider call wiring. Order comes from PROVIDER_PRIORITY, so the paid
+   * provider stays first without this map encoding a second ordering.
+   */
+  const builders: Record<
+    ProviderName,
+    () => { model: string; run: () => Promise<PackedPrompt & { text: string }> }
+  > = {
+    openai: () => ({
+      model: env.OPENAI_MODEL || "",
+      run: () =>
+        runWithShrinkRetry(
+          input,
+          "openai",
+          budgetForProvider(env, "openai"),
+          (userPrompt) =>
+            callOpenAICompatible({
+              provider: "OpenAI",
+              url: `${openaiBaseUrl(env)}/chat/completions`,
+              apiKey: env.OPENAI_API_KEY!,
+              model: env.OPENAI_MODEL!,
+              userPrompt,
+              maxTokens: 2_048,
+              maxTokensField: openaiMaxTokensField(env),
+              // Reasoning models reject a non-default temperature, and the
+              // operator's reasoning_effort is what says the paid model is one.
+              // A gateway that still objects recovers: the body sheds fields.
+              omitTemperature: Boolean(env.OPENAI_REASONING_EFFORT),
+              extraBody: env.OPENAI_REASONING_EFFORT
+                ? { reasoning_effort: env.OPENAI_REASONING_EFFORT }
+                : undefined,
+            }),
+        ),
+    }),
+    gemini: () => ({
       model: geminiModel(env),
-      enabled: Boolean(env.GEMINI_API_KEY),
       run: () =>
         runWithShrinkRetry(
           input,
@@ -566,11 +907,9 @@ export async function generateRoast(
           budgetForProvider(env, "gemini"),
           (userPrompt) => callGemini(env, userPrompt),
         ),
-    },
-    {
-      name: "workersai",
+    }),
+    workersai: () => ({
       model: workersAiModel(env),
-      enabled: Boolean(env.AI),
       run: () =>
         runWithShrinkRetry(
           input,
@@ -578,11 +917,9 @@ export async function generateRoast(
           budgetForProvider(env, "workersai"),
           (userPrompt) => callWorkersAi(env, userPrompt),
         ),
-    },
-    {
-      name: "groq",
+    }),
+    groq: () => ({
       model: groqModel(env),
-      enabled: Boolean(env.GROQ_API_KEY),
       run: () =>
         runWithShrinkRetry(
           input,
@@ -605,13 +942,28 @@ export async function generateRoast(
               },
             }),
         ),
-    },
-  ];
+    }),
+  };
+
+  const attempts: Array<{
+    name: ProviderName;
+    model: string;
+    enabled: boolean;
+    run: () => Promise<PackedPrompt & { text: string }>;
+  }> = PROVIDER_PRIORITY.map((name) => ({
+    name,
+    enabled: PROVIDER_ENABLED[name](env),
+    ...builders[name](),
+  }));
 
   const configured = attempts.filter((a) => a.enabled);
   if (configured.length === 0) {
     throw new RoastError("No AI providers configured.");
   }
+
+  console.error(
+    `Roast provider order: ${configured.map((a) => a.name).join(" → ")}`,
+  );
 
   for (const attempt of configured) {
     try {
@@ -688,9 +1040,8 @@ export async function generateRoast(
       }
 
       return {
-        text: coverageNote
-          ? `${coverageNote}\n\n${dehedged.text}`
-          : dehedged.text,
+        text: dehedged.text,
+        partialNote: coverageNote,
         provider: attempt.name,
         model: attempt.model,
         coverage,

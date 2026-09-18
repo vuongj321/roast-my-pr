@@ -167,6 +167,52 @@ describe("review state footer", () => {
     const body = `Real roast body${buildRoastFooter("groq", STATE)}`;
     assert.equal(stripRoastFooter(body), "Real roast body");
   });
+
+  it("renders the coverage note under the attribution, not above the roast", () => {
+    const note = buildPartialReviewNote({
+      includedFiles: 6,
+      totalFiles: 25,
+      shownChars: 7_000,
+      totalChars: 71_000,
+    })!;
+    const body = `Real roast body${buildRoastFooter("groq", STATE, note)}`;
+
+    const attribution = body.indexOf("Reviewed by **Roast my PR**");
+    assert.ok(attribution > -1);
+    assert.ok(body.indexOf(note) > attribution);
+    assert.ok(body.startsWith("Real roast body"));
+    // The next run still reads the state, and neither footer part reaches the model.
+    assert.equal(readRoastState(body)!.sha, STATE.sha);
+    assert.equal(stripRoastFooter(body), "Real roast body");
+  });
+
+  it("drops prompt echoes stored by an earlier bad run", () => {
+    const state: RoastState = {
+      v: 1,
+      sha: "731a1989d332e68e6073bfaac331c525f39d12af",
+      findings: [
+        { id: "F1", text: "* PR Title: `feat(roast): add a paid provider`" },
+        { id: "F2", text: "* Author: `@vuongj321`" },
+        { id: "F3", path: "src/a.ts", text: "* `src/a.ts` never retries." },
+        {
+          id: "F4",
+          path: "src/retry.ts",
+          text: "- **Reviewing the retry loop:** `src/retry.ts` never resets.",
+        },
+      ],
+    };
+    const body = `Roast text${buildRoastFooter("gemma", state)}`;
+    const parsed = readRoastState(body);
+
+    assert.deepEqual(parsed!.findings, [
+      { id: "F3", path: "src/a.ts", text: "* `src/a.ts` never retries." },
+      {
+        id: "F4",
+        path: "src/retry.ts",
+        text: "- **Reviewing the retry loop:** `src/retry.ts` never resets.",
+      },
+    ]);
+  });
 });
 
 describe("parseFindingsFromRoast", () => {
@@ -188,6 +234,40 @@ Grudging respect.
     assert.equal(findings[0]!.id, "F1");
     assert.equal(findings[0]!.path, "apps/api/src/orgs/orgs.service.ts");
     assert.match(findings[2]!.text, /Bulk-revoke/);
+  });
+
+  it("ignores planning labels and prompt echoes", () => {
+    const dump = `### What I'd send back
+* PR Title: \`feat(roast): add a paid provider\`
+* Author: \`@vuongj321\`
+* Key Changes:
+* *Drafting the specific insults*:
+* \`src/roast.ts\`: the attempts mapping is overkill.
+- \`src/github.ts\`: MAX_PRIOR_ROAST_PAGES is arbitrary.`;
+
+    const findings = parseFindingsFromRoast(dump);
+
+    assert.deepEqual(
+      findings.map((f) => f.text),
+      [
+        "* `src/roast.ts`: the attempts mapping is overkill.",
+        "- `src/github.ts`: MAX_PRIOR_ROAST_PAGES is arbitrary.",
+      ],
+    );
+  });
+
+  it("keeps a finding that opens with a process word", () => {
+    // Same predicate guards the footer state, so an over-broad label match used
+    // to erase legitimate findings from review memory, not just from a reply.
+    const roast = `### What I'd send back
+- **Reviewing the retry loop:** \`src/retry.ts\` never resets the backoff.`;
+
+    const findings = parseFindingsFromRoast(roast);
+
+    assert.deepEqual(
+      findings.map((f) => f.text),
+      ["- **Reviewing the retry loop:** `src/retry.ts` never resets the backoff."],
+    );
   });
 
   it("returns nothing for an empty or footer-only roast", () => {
@@ -322,6 +402,21 @@ describe("buildPartialReviewNote", () => {
     assert.ok(note);
     assert.match(note!, /fallback model \(`groq`\)/);
     assert.match(note!, /Claims outside the packed slice are unverified/);
+  });
+
+  it("does not call the paid provider a fallback model", () => {
+    const note = buildPartialReviewNote(
+      {
+        includedFiles: 6,
+        totalFiles: 25,
+        shownChars: 7_000,
+        totalChars: 71_000,
+      },
+      { provider: "openai" },
+    );
+    assert.ok(note);
+    assert.match(note!, /^_Partial review: only 6 of 25 changed files/);
+    assert.doesNotMatch(note!, /fallback model/);
   });
 });
 

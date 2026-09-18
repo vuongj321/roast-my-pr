@@ -4,6 +4,7 @@
 
 import { extractCitedPaths, type PartialFile } from "./diffPack.js";
 import { splitBulletBlocks } from "./pathFilter.js";
+import { isPlanningLabel } from "./responseText.js";
 import type {
   PackCoverage,
   PriorFinding,
@@ -35,12 +36,18 @@ export const MAX_PRIOR_FINDINGS = 8;
 const MAX_FINDING_CHARS = 240;
 
 /**
- * Roast footer, optionally carrying machine-readable review state so the next
- * run knows which SHA was reviewed and what was flagged (with ids).
+ * Roast footer: the attribution line, an optional partial-coverage note under it
+ * (see `buildPartialReviewNote`), and the machine-readable review state so the
+ * next run knows which SHA was reviewed and what was flagged (with ids).
  */
-export function buildRoastFooter(model: string, state?: RoastState): string {
+export function buildRoastFooter(
+  model: string,
+  state?: RoastState,
+  partialNote?: string | null,
+): string {
+  const note = partialNote ? `\n\n${partialNote}` : "";
   const hidden = state ? `\n<!-- ${serializeRoastState(state)} -->` : "";
-  return `\n\n---\n*${ROAST_FOOTER_MARKER} · \`${model}\` · self-hosted free-tier bot*${hidden}`;
+  return `\n\n---\n*${ROAST_FOOTER_MARKER} · \`${model}\` · self-hosted free-tier bot*${note}${hidden}`;
 }
 
 /**
@@ -76,6 +83,10 @@ export function readRoastState(
                   typeof (f as PriorFinding).text === "string",
               ),
           )
+          // State written by a planning dump holds prompt echoes ("PR Title: …")
+          // rather than findings; carrying them forward asks the next roast to
+          // report them resolved or still present.
+          .filter((f) => !isPlanningLabel(f.text))
           .slice(0, MAX_PRIOR_FINDINGS + 8)
           .map((f) => ({
             id: f.id,
@@ -125,6 +136,10 @@ export function parseFindingsFromRoast(
     if (findings.length >= maxFindings) break;
     const flat = block.replace(/\s+/g, " ").trim();
     if (!flat) continue;
+    // A planning label is not a finding: storing "* Key Changes:" or
+    // "* PR Title: `feat(roast)…`" makes the next run account for prompt
+    // structure instead of review points.
+    if (isPlanningLabel(flat)) continue;
     findings.push({
       id: `F${findings.length + 1}`,
       path: extractCitedPaths(flat)[0],
@@ -324,16 +339,21 @@ ${truncationNote}${partialNote}${lowCoverageNote}${deltaSection}${findingsSectio
 /** Below this share of changed files, the roast is labelled a partial review. */
 export const PARTIAL_REVIEW_FILE_RATIO = 0.5;
 
+/** Only the free-tier failovers get the "fallback model" wording. */
+const FALLBACK_PROVIDERS = new Set(["workersai", "groq"]);
+
 export type PartialReviewNoteOptions = {
-  /** Winning provider name (gemini / groq / workersai). */
+  /** Winning provider name (openai / gemini / workersai / groq). */
   provider?: string;
   /** True when packing dropped files or hunks. */
   truncated?: boolean;
 };
 
 /**
- * Visible banner for runs where the provider budget only covered a fraction of
- * the PR. A confidently narrow review is better than a silently narrow one.
+ * Visible note for runs where the provider budget only covered a fraction of the
+ * PR. A confidently narrow review is better than a silently narrow one, but the
+ * reader is already past the review by then, so it renders under the footer
+ * attribution (`buildRoastFooter`) rather than above the roast.
  */
 export function buildPartialReviewNote(
   coverage: PackCoverage,
@@ -351,7 +371,7 @@ export function buildPartialReviewNote(
 
   const pct = totalChars > 0 ? Math.round((shownChars / totalChars) * 100) : 0;
   const provider = (options.provider || "").toLowerCase();
-  const isFallback = provider !== "" && provider !== "gemini";
+  const isFallback = FALLBACK_PROVIDERS.has(provider);
 
   if (isFallback) {
     return `_Partial review via fallback model (\`${provider}\`): only ${includedFiles} of ${totalFiles} changed files fitted the provider's budget (~${pct}% of the diff text). Claims outside the packed slice are unverified._`;

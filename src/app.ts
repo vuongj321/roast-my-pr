@@ -16,8 +16,10 @@ import {
   buildRoastFooter,
   parseFindingsFromRoast,
   readRoastState,
+  stripRoastFooter,
 } from "./prompts.js";
 import { consumeRoastSlot } from "./rateLimit.js";
+import { isPlanningDump, isPostableRoast } from "./responseText.js";
 import { RoastQuotaError, generateRoast } from "./roast.js";
 
 interface IssueCommentPayload {
@@ -99,17 +101,24 @@ export async function handleIssueComment(
     // fall back to deriving findings from their bullets.
     const priorState = readRoastState(priorComment?.body);
     const priorRoast = priorComment?.body ?? null;
-    const priorFindings = priorState?.findings.length
-      ? priorState.findings
-      : parseFindingsFromRoast(priorRoast ?? "");
+    // A prior comment that is a planning dump was never a review: its stored
+    // findings are prompt echoes ("Author: @x") and its SHA is meaningless, so
+    // neither is carried into this run.
+    const priorUsable = !isPlanningDump(stripRoastFooter(priorRoast ?? ""));
+    const priorFindings = priorUsable
+      ? priorState?.findings.length
+        ? priorState.findings
+        : parseFindingsFromRoast(priorRoast ?? "")
+      : [];
+    const priorSha = priorUsable ? (priorState?.sha ?? null) : null;
 
     let delta: ReviewDelta | null = null;
-    if (priorState?.sha && pull.headSha && priorState.sha !== pull.headSha) {
+    if (priorSha && pull.headSha && priorSha !== pull.headSha) {
       const fetched = await fetchReviewDelta(
         octokit,
         owner,
         repo,
-        priorState.sha,
+        priorSha,
         pull.headSha,
       );
       if (!fetched.unavailable && fetched.files.length > 0) delta = fetched;
@@ -127,20 +136,24 @@ export async function handleIssueComment(
       commitMessages: pull.commitMessages,
       priorRoast,
       priorFindings,
-      reviewedSha: priorState?.sha ?? null,
+      reviewedSha: priorSha,
       deltaFiles: delta?.files,
       deltaCommits: delta?.commits,
       deltaCommitMessages: delta?.commitMessages,
     });
 
     console.error(
-      `Roast posted (${roast.provider}): coverage ${roast.coverage.includedFiles}/${roast.coverage.totalFiles} files (${roast.coverage.shownChars}/${roast.coverage.totalChars} patch chars); priorFindings=${priorFindings.length}; deltaFiles=${delta?.files.length ?? 0}; reviewedSha=${priorState?.sha?.slice(0, 7) ?? "none"}`,
+      `Roast posted (${roast.provider}): coverage ${roast.coverage.includedFiles}/${roast.coverage.totalFiles} files (${roast.coverage.shownChars}/${roast.coverage.totalChars} patch chars); priorFindings=${priorFindings.length}; deltaFiles=${delta?.files.length ?? 0}; reviewedSha=${priorSha?.slice(0, 7) ?? "none"}`,
     );
 
     const state: RoastState = {
       v: 1,
       sha: pull.headSha,
-      findings: parseFindingsFromRoast(roast.text),
+      // Only a structured roast has findings worth remembering; a fallback dump
+      // must not seed the next run's accounting.
+      findings: isPostableRoast(roast.text)
+        ? parseFindingsFromRoast(roast.text)
+        : [],
     };
 
     await postComment(
@@ -148,7 +161,7 @@ export async function handleIssueComment(
       owner,
       repo,
       number,
-      `${roast.text}${buildRoastFooter(roast.model, state)}`,
+      `${roast.text}${buildRoastFooter(roast.model, state, roast.partialNote)}`,
     );
   } catch (err) {
     console.error("Roast failed", formatGithubError(err));
