@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   extractModelText,
+  isPlanningDump,
+  isPostableRoast,
   isTruncatedRoastText,
   isUsableRoastText,
   looksLikeFinishedRoast,
+  rawAnswerText,
 } from "./responseText.js";
 
 const FINISHED = `# Headline
@@ -155,6 +158,105 @@ describe("isTruncatedRoastText", () => {
     assert.equal(
       isTruncatedRoastText("Ship it after you fix the race. Reluctantly."),
       false,
+    );
+  });
+});
+
+/**
+ * Excerpted verbatim from the comment the bot posted on PR #4: Gemma's planning
+ * notes, published as the roast. Note that it *does* carry a real
+ * "What I'd send back" heading — the structure check alone never stopped it.
+ */
+const PR4_PLANNING_DUMP = `*   PR Title: \`feat(roast): add an optional paid OpenAI-compatible provider\`
+    *   Author: \`@vuongj321\`
+    *   Summary: Adds OpenAI-compatible provider support (highest priority).
+    *   Key Changes:
+        *   \`src/roast.ts\`: Added \`openaiBaseUrl\`, \`isOpenAiEnabled\`, \`PROVIDER_PRIORITY\`.
+
+    *   *Reviewing the "Fix it" items*:
+        *   The \`openaiMaxTokensField\` logic: it works.
+
+### What I'd send back
+*   \`src/roast.ts\`: The \`attempts\` mapping in \`generateRoast\` is overkill.
+
+*   *Drafting the specific insults*:
+- \`src/roast.ts\`: "You're running all provider builders even if they're disabled."
+- \`src/prompts.ts\`: "Hardcoding \`FALLBACK_PROVIDERS\` as a \`Set\` is a manual labor tax."
+*   *Refining "Fix it"*:
+1. Replace the arbitrary page cap in \`src/github.ts\`.
+*   *Closer*: "The GitHub fix is a band-aid, but the OpenAI integration is actually usable."
+*   *Wait, check the \`generateRoast\` logic again*:
+        Actually, it's not that bad. It's very readable. I'll focus on the builder execution.`;
+
+describe("planning dumps", () => {
+  it("rejects the dump that was posted on PR #4", () => {
+    assert.equal(isPlanningDump(PR4_PLANNING_DUMP), true);
+    assert.equal(isUsableRoastText(PR4_PLANNING_DUMP), false);
+    assert.equal(isPostableRoast(PR4_PLANNING_DUMP), false);
+    assert.equal(extractModelText({ response: PR4_PLANNING_DUMP }), "");
+    assert.equal(
+      extractModelText({
+        choices: [{ message: { content: PR4_PLANNING_DUMP } }],
+      }),
+      "",
+    );
+  });
+
+  it("keeps the rejected text available for logs", () => {
+    assert.match(
+      rawAnswerText({ response: PR4_PLANNING_DUMP }),
+      /Drafting the specific insults/,
+    );
+  });
+
+  it("still uses a usable field when another one is a dump", () => {
+    assert.equal(
+      extractModelText({
+        response: FINISHED,
+        choices: [{ message: { content: PR4_PLANNING_DUMP } }],
+      }),
+      FINISHED,
+    );
+  });
+
+  it("keeps legitimate category labels and lead-in bullets", () => {
+    const roast = `# A thesaurus commit
+
+### What I'd send back
+- **Bug:** \`src/db.ts\` swallows the conflict error.
+* \`src/db.ts\`:
+  - the retry loop can double-insert
+
+### Fix it
+1. Catch the unique violation.
+`;
+    assert.equal(isPlanningDump(roast), false);
+    assert.equal(isPostableRoast(roast), true);
+  });
+});
+
+describe("isPostableRoast", () => {
+  it("requires a structured review, not a chat summary", () => {
+    assert.equal(isPostableRoast(FINISHED), true);
+    assert.equal(isPostableRoast("Sure! Here's a summary of the PR."), false);
+    assert.equal(isPostableRoast(""), false);
+  });
+
+  it("rejects a roast cut off mid-bullet", () => {
+    assert.equal(
+      isPostableRoast(
+        "### What I'd send back\n* **`register-user.ts`**: You moved registration writes into `db.transaction()`, but",
+      ),
+      false,
+    );
+  });
+
+  it("is what extractModelText applies to content", () => {
+    assert.equal(
+      extractModelText({
+        choices: [{ message: { content: "Sure! Here's a summary." } }],
+      }),
+      "",
     );
   });
 });
