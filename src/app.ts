@@ -1,17 +1,21 @@
-import type { Env } from "./types.js";
+import type { Env, RoastState } from "./types.js";
 import { isPullRequestComment, parseCommand } from "./command.js";
 import {
   createAppOctokit,
-  fetchLatestPriorRoast,
+  fetchLatestPriorRoastComment,
   fetchPullContext,
+  fetchReviewDelta,
   formatGithubError,
   postComment,
+  type ReviewDelta,
 } from "./github.js";
 import {
   ERROR_COMMENT,
   QUOTA_COMMENT,
   RATE_LIMIT_COMMENT,
   buildRoastFooter,
+  parseFindingsFromRoast,
+  readRoastState,
 } from "./prompts.js";
 import { consumeRoastSlot } from "./rateLimit.js";
 import { RoastQuotaError, generateRoast } from "./roast.js";
@@ -79,9 +83,9 @@ export async function handleIssueComment(
 
   try {
     const excludeCommentId = payload.comment?.id;
-    const [pull, priorRoast] = await Promise.all([
+    const [pull, priorComment] = await Promise.all([
       fetchPullContext(octokit, owner, repo, number),
-      fetchLatestPriorRoast(
+      fetchLatestPriorRoastComment(
         octokit,
         owner,
         repo,
@@ -89,6 +93,27 @@ export async function handleIssueComment(
         excludeCommentId,
       ),
     ]);
+
+    // Review state is what lets this run answer "did you already fix that?"
+    // instead of guessing from a packed diff. Older roasts have no state, so we
+    // fall back to deriving findings from their bullets.
+    const priorState = readRoastState(priorComment?.body);
+    const priorRoast = priorComment?.body ?? null;
+    const priorFindings = priorState?.findings.length
+      ? priorState.findings
+      : parseFindingsFromRoast(priorRoast ?? "");
+
+    let delta: ReviewDelta | null = null;
+    if (priorState?.sha && pull.headSha && priorState.sha !== pull.headSha) {
+      const fetched = await fetchReviewDelta(
+        octokit,
+        owner,
+        repo,
+        priorState.sha,
+        pull.headSha,
+      );
+      if (!fetched.unavailable && fetched.files.length > 0) delta = fetched;
+    }
 
     const roast = await generateRoast(env, {
       owner,
@@ -99,15 +124,31 @@ export async function handleIssueComment(
       author: pull.author,
       files: pull.files,
       filesIncomplete: pull.filesIncomplete,
+      commitMessages: pull.commitMessages,
       priorRoast,
+      priorFindings,
+      reviewedSha: priorState?.sha ?? null,
+      deltaFiles: delta?.files,
+      deltaCommits: delta?.commits,
+      deltaCommitMessages: delta?.commitMessages,
     });
+
+    console.error(
+      `Roast posted (${roast.provider}): coverage ${roast.coverage.includedFiles}/${roast.coverage.totalFiles} files (${roast.coverage.shownChars}/${roast.coverage.totalChars} patch chars); priorFindings=${priorFindings.length}; deltaFiles=${delta?.files.length ?? 0}; reviewedSha=${priorState?.sha?.slice(0, 7) ?? "none"}`,
+    );
+
+    const state: RoastState = {
+      v: 1,
+      sha: pull.headSha,
+      findings: parseFindingsFromRoast(roast.text),
+    };
 
     await postComment(
       octokit,
       owner,
       repo,
       number,
-      `${roast.text}${buildRoastFooter(roast.model)}`,
+      `${roast.text}${buildRoastFooter(roast.model, state)}`,
     );
   } catch (err) {
     console.error("Roast failed", formatGithubError(err));

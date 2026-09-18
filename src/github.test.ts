@@ -3,8 +3,14 @@ import { describe, it } from "node:test";
 import {
   isRoastBotComment,
   selectLatestPriorRoast,
+  selectLatestPriorRoastComment,
+  truncateCommitSubject,
+  commitSubjectsFromMessages,
+  MAX_COMMIT_MESSAGES,
+  MAX_COMMIT_SUBJECT_CHARS,
 } from "./github.js";
-import { ROAST_FOOTER_MARKER, buildRoastFooter } from "./prompts.js";
+import { ROAST_FOOTER_MARKER, buildRoastFooter, readRoastState } from "./prompts.js";
+import type { RoastState } from "./types.js";
 
 describe("isRoastBotComment", () => {
   it("detects footer-marked roast comments", () => {
@@ -21,7 +27,38 @@ describe("isRoastBotComment", () => {
   });
 });
 
-describe("selectLatestPriorRoast", () => {
+describe("selectLatestPriorRoastComment", () => {
+  it("returns the comment id alongside the body so state can be read", () => {
+    const state: RoastState = {
+      v: 1,
+      sha: "d63231d42ba562440d6812538ec72a2160ba37d1",
+      findings: [{ id: "F1", text: "- No transaction around provisioning." }],
+    };
+    const picked = selectLatestPriorRoastComment([
+      { id: 1, body: "/roastmypr" },
+      { id: 2, body: `older${buildRoastFooter("groq")}` },
+      { id: 4, body: `newer${buildRoastFooter("gemini-3.6-flash", state)}` },
+    ]);
+
+    assert.ok(picked);
+    assert.equal(picked!.id, 4);
+    const parsed = readRoastState(picked!.body);
+    assert.equal(parsed!.sha, state.sha);
+  });
+
+  it("returns null when nothing is footer-marked or it is excluded", () => {
+    assert.equal(selectLatestPriorRoastComment([{ id: 1, body: "lgtm" }]), null);
+    assert.equal(
+      selectLatestPriorRoastComment(
+        [{ id: 9, body: `roast${buildRoastFooter("groq")}` }],
+        9,
+      ),
+      null,
+    );
+  });
+});
+
+describe("selectLatestPriorRoast (deprecated wrapper)", () => {
   it("returns null when there are no roast comments", () => {
     assert.equal(
       selectLatestPriorRoast([
@@ -60,5 +97,28 @@ describe("selectLatestPriorRoast", () => {
       ),
       roast.trim(),
     );
+  });
+});
+
+describe("commitSubjectsFromMessages", () => {
+  it("keeps the first line and clips long subjects", () => {
+    assert.equal(
+      truncateCommitSubject("feat: add widgets\n\nLong body here"),
+      "feat: add widgets",
+    );
+    const long = `x${"y".repeat(MAX_COMMIT_SUBJECT_CHARS)}`;
+    const clipped = truncateCommitSubject(long);
+    assert.ok(clipped.length <= MAX_COMMIT_SUBJECT_CHARS);
+    assert.match(clipped, /…$/);
+  });
+
+  it("caps how many subjects are kept", () => {
+    const messages = Array.from(
+      { length: MAX_COMMIT_MESSAGES + 5 },
+      (_, i) => `commit ${i}`,
+    );
+    const subjects = commitSubjectsFromMessages(messages);
+    assert.equal(subjects.length, MAX_COMMIT_MESSAGES);
+    assert.equal(subjects[0], "commit 0");
   });
 });
