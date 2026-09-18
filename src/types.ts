@@ -15,7 +15,11 @@ export interface Env {
   OPENAI_MODEL?: string;
   /** Defaults to https://api.openai.com/v1 — any OpenAI-shaped gateway works. */
   OPENAI_BASE_URL?: string;
-  /** Optional reasoning_effort for reasoning models (none | low | medium | high). */
+  /**
+   * Optional `reasoning_effort` for reasoning models (low | medium | high).
+   * Setting it also marks the paid model as a reasoner, so `temperature` is
+   * omitted — those models reject a non-default one.
+   */
   OPENAI_REASONING_EFFORT?: string;
   /** Token cap field: max_completion_tokens (default) | max_tokens | omit. */
   OPENAI_MAX_TOKENS_FIELD?: string;

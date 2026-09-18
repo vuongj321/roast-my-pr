@@ -344,11 +344,51 @@ export type RoastResult = {
   coverage: PackCoverage;
 };
 
+/** Hard ceiling for one outbound provider request, so a stall cannot hold the webhook open. */
+export const LLM_TIMEOUT_MS = 30_000;
+
+function formatDuration(ms: number): string {
+  return ms >= 1_000 ? `${Math.round(ms / 1_000)}s` : `${ms}ms`;
+}
+
+/**
+ * POST to a provider with a deadline. The roast runs inline in the webhook, so a
+ * provider that stops answering costs the whole comment — not just its own turn
+ * — while the next provider in the chain would have answered. A timeout is never
+ * "quota-like", so the chain keeps walking instead of reporting a rate limit.
+ */
+export async function fetchWithTimeout(
+  provider: string,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number = LLM_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    const aborted = err instanceof Error && err.name === "AbortError";
+    const message = aborted
+      ? `${provider} did not answer within ${formatDuration(timeoutMs)}.`
+      : err instanceof Error
+        ? err.message
+        : `${provider} request failed.`;
+    throw Object.assign(new Error(message), {
+      quotaLike: false,
+      tooLarge: false,
+      emptyCompletion: false,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function callGemini(env: Env, userPrompt: string): Promise<string> {
   const model = geminiModel(env);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout("Gemini", url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -469,6 +509,66 @@ function unusableOutputError(provider: string, data: unknown): Error {
   );
 }
 
+/** The body fields a gateway can refuse, most featureful first. */
+type OpenAiBodyShape = {
+  maxTokensField: "max_tokens" | "max_completion_tokens" | "omit";
+  temperature: boolean;
+  extraBody?: Record<string, unknown>;
+};
+
+/**
+ * Bodies to try for one paid call: the configured shape, the same thing without
+ * our extra fields, then a bare `model` + `messages` request.
+ *
+ * A gateway can 400 on any field we added — `reasoning_effort` on a
+ * non-reasoning model, `max_completion_tokens` on an older or narrower gateway,
+ * a non-default `temperature` on a reasoning model — and each of those would
+ * otherwise drop the paid provider out of the chain for a whole roast. The
+ * plainer request is what every OpenAI-compatible vendor documents as supported.
+ * Identical bodies collapse, so an unconfigured paid call still sends one request.
+ */
+function paidRequestBodies(options: {
+  model: string;
+  userPrompt: string;
+  maxTokens?: number;
+  maxTokensField?: "max_tokens" | "max_completion_tokens" | "omit";
+  omitTemperature?: boolean;
+  extraBody?: Record<string, unknown>;
+}): Record<string, unknown>[] {
+  const capField = options.maxTokensField ?? "max_tokens";
+  const shapes: OpenAiBodyShape[] = [
+    {
+      maxTokensField: capField,
+      temperature: !options.omitTemperature,
+      extraBody: options.extraBody,
+    },
+    { maxTokensField: capField, temperature: !options.omitTemperature },
+    { maxTokensField: "omit", temperature: false },
+  ];
+
+  const bodies: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const shape of shapes) {
+    const body: Record<string, unknown> = {
+      model: options.model,
+      ...(shape.temperature ? { temperature: 0.9 } : {}),
+      ...(shape.maxTokensField === "omit"
+        ? {}
+        : { [shape.maxTokensField]: options.maxTokens ?? 2048 }),
+      messages: [
+        { role: "system", content: ROAST_SYSTEM_PROMPT },
+        { role: "user", content: options.userPrompt },
+      ],
+      ...shape.extraBody,
+    };
+    const key = JSON.stringify(body);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    bodies.push(body);
+  }
+  return bodies;
+}
+
 export async function callOpenAICompatible(options: {
   provider: string;
   url: string;
@@ -481,69 +581,75 @@ export async function callOpenAICompatible(options: {
    * OpenAI's reasoning models expect `max_completion_tokens`.
    */
   maxTokensField?: "max_tokens" | "max_completion_tokens" | "omit";
-  /** Reasoning models reject a non-default temperature, so the paid path omits it. */
+  /**
+   * Reasoning models reject a non-default temperature. The paid caller omits it
+   * when the operator declared a reasoning model via `OPENAI_REASONING_EFFORT`.
+   */
   omitTemperature?: boolean;
   extraHeaders?: Record<string, string>;
   /** Extra OpenAI-compatible body fields (e.g. Groq reasoning controls). */
   extraBody?: Record<string, unknown>;
 }): Promise<string> {
-  const maxTokensField = options.maxTokensField ?? "max_tokens";
-  const tokenCap =
-    maxTokensField === "omit"
-      ? {}
-      : { [maxTokensField]: options.maxTokens ?? 2048 };
+  const bodies = paidRequestBodies(options);
+  let refusedField: Error | undefined;
 
-  const res = await fetch(options.url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${options.apiKey}`,
-      ...options.extraHeaders,
-    },
-    body: JSON.stringify({
-      model: options.model,
-      ...(options.omitTemperature ? {} : { temperature: 0.9 }),
-      ...tokenCap,
-      messages: [
-        { role: "system", content: ROAST_SYSTEM_PROMPT },
-        { role: "user", content: options.userPrompt },
-      ],
-      ...options.extraBody,
-    }),
-  });
-
-  const data = (await res.json()) as OpenAIChatResponse;
-  // Logged before the error checks: a failed call still burns tokens, which
-  // matters most on the paid provider.
-  logOpenAiUsage(options.provider, data);
-
-  if (!res.ok) {
-    const message =
-      data.error?.message || `${options.provider} HTTP ${res.status}`;
-    const quotaLike =
-      isRetryableStatus(res.status) || isQuotaLikeMessage(message);
-    throw Object.assign(new Error(message), {
-      quotaLike,
-      tooLarge: isPromptTooLargeMessage(message),
-      emptyCompletion: false,
+  for (let index = 0; index < bodies.length; index += 1) {
+    const res = await fetchWithTimeout(options.provider, options.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${options.apiKey}`,
+        ...options.extraHeaders,
+      },
+      body: JSON.stringify(bodies[index]),
     });
+
+    const data = (await res.json()) as OpenAIChatResponse;
+    // Logged before the error checks: a failed call still burns tokens, which
+    // matters most on the paid provider.
+    logOpenAiUsage(options.provider, data);
+
+    if (!res.ok) {
+      const message =
+        data.error?.message || `${options.provider} HTTP ${res.status}`;
+      const error = Object.assign(new Error(message), {
+        quotaLike: isRetryableStatus(res.status) || isQuotaLikeMessage(message),
+        tooLarge: isPromptTooLargeMessage(message),
+        emptyCompletion: false,
+      });
+      // A refused field says nothing about the roast: shed ours, ask again with
+      // the plainer body, and keep the paid provider in the chain.
+      if (index < bodies.length - 1 && isUnsupportedParameterError(error)) {
+        refusedField = error;
+        console.error(
+          `Roast provider ${options.provider}: gateway refused a request field (${message}) — retrying with a plainer body`,
+        );
+        continue;
+      }
+      throw error;
+    }
+
+    const text = extractModelText(data);
+    if (!text) {
+      const answer = rawAnswerText(data);
+      logRejectedAnswer(
+        options.provider,
+        isPlanningDump(answer)
+          ? "returned planning notes, not a roast"
+          : "returned an empty roast",
+        answer,
+        data,
+      );
+      throw unusableOutputError(options.provider, data);
+    }
+
+    return text;
   }
 
-  const text = extractModelText(data);
-  if (!text) {
-    const answer = rawAnswerText(data);
-    logRejectedAnswer(
-      options.provider,
-      isPlanningDump(answer)
-        ? "returned planning notes, not a roast"
-        : "returned an empty roast",
-      answer,
-      data,
-    );
-    throw unusableOutputError(options.provider, data);
-  }
-
-  return text;
+  throw (
+    refusedField ??
+    new Error(`${options.provider} failed with every request shape.`)
+  );
 }
 
 /**
@@ -777,8 +883,10 @@ export async function generateRoast(
               userPrompt,
               maxTokens: 2_048,
               maxTokensField: openaiMaxTokensField(env),
-              // Reasoning models only accept the default temperature.
-              omitTemperature: true,
+              // Reasoning models reject a non-default temperature, and the
+              // operator's reasoning_effort is what says the paid model is one.
+              // A gateway that still objects recovers: the body sheds fields.
+              omitTemperature: Boolean(env.OPENAI_REASONING_EFFORT),
               extraBody: env.OPENAI_REASONING_EFFORT
                 ? { reasoning_effort: env.OPENAI_REASONING_EFFORT }
                 : undefined,

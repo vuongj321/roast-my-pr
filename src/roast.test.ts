@@ -5,6 +5,7 @@ import {
   PROVIDER_PRIORITY,
   callOpenAICompatible,
   enabledProviders,
+  fetchWithTimeout,
   generateRoast,
   providerConfigWarnings,
   type RoastInput,
@@ -296,6 +297,126 @@ describe("callOpenAICompatible", () => {
       /Incorrect API key provided/,
     );
   });
+
+  it("retries with a plainer body when the gateway refuses a field", async () => {
+    const calls = stubFetch((_call, index) =>
+      index === 0
+        ? jsonResponse(
+            {
+              error: {
+                message:
+                  "Unsupported parameter: 'reasoning_effort' is not supported with this model.",
+              },
+            },
+            400,
+          )
+        : jsonResponse(openAiPayload()),
+    );
+
+    const text = await callOpenAICompatible({
+      provider: "OpenAI",
+      url: "https://gateway.example/openai/v1/chat/completions",
+      apiKey: "sk-test",
+      model: PAID_MODEL,
+      userPrompt: "review this",
+      maxTokens: 2_048,
+      maxTokensField: "max_completion_tokens",
+      omitTemperature: true,
+      extraBody: { reasoning_effort: "low" },
+    });
+
+    assert.equal(text, ROAST);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]!.body.reasoning_effort, "low");
+    assert.equal(calls[1]!.body.reasoning_effort, undefined);
+    assert.equal(calls[1]!.body.max_completion_tokens, 2_048);
+    assert.equal(calls[1]!.body.model, PAID_MODEL);
+  });
+
+  it("sheds the token cap when the gateway does not know that field", async () => {
+    const calls = stubFetch((_call, index) =>
+      index === 0
+        ? jsonResponse(
+            {
+              error: {
+                message:
+                  "Unrecognized request argument supplied: max_completion_tokens",
+              },
+            },
+            400,
+          )
+        : jsonResponse(openAiPayload()),
+    );
+
+    const text = await callOpenAICompatible({
+      provider: "OpenAI",
+      url: "https://api.openai.com/v1/chat/completions",
+      apiKey: "sk-test",
+      model: PAID_MODEL,
+      userPrompt: "review this",
+      maxTokensField: "max_completion_tokens",
+    });
+
+    assert.equal(text, ROAST);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]!.body.max_completion_tokens, 2_048);
+    // Last resort is `model` + `messages`, which every gateway accepts.
+    assert.deepEqual(Object.keys(calls[1]!.body).sort(), ["messages", "model"]);
+  });
+
+  it("does not buy a second call for an unrelated rejection", async () => {
+    const calls = stubFetch(() =>
+      jsonResponse({ error: { message: "Incorrect API key provided" } }, 401),
+    );
+
+    await assert.rejects(
+      () =>
+        callOpenAICompatible({
+          provider: "OpenAI",
+          url: "https://api.openai.com/v1/chat/completions",
+          apiKey: "sk-bad",
+          model: PAID_MODEL,
+          userPrompt: "review this",
+          extraBody: { reasoning_effort: "low" },
+        }),
+      /Incorrect API key provided/,
+    );
+    assert.equal(calls.length, 1);
+  });
+});
+
+describe("fetchWithTimeout", () => {
+  it("gives up on a provider that never answers", async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        });
+      })) as unknown as typeof fetch;
+
+    await assert.rejects(
+      () =>
+        fetchWithTimeout(
+          "OpenAI",
+          "https://api.openai.com/v1/chat/completions",
+          {},
+          5,
+        ),
+      /did not answer within 5ms/,
+    );
+  });
+
+  it("reports a connection failure as itself, not as a timeout", async () => {
+    globalThis.fetch = (async () => {
+      throw new TypeError("fetch failed: ECONNREFUSED");
+    }) as unknown as typeof fetch;
+
+    await assert.rejects(
+      () =>
+        fetchWithTimeout("Gemini", "https://gateway.example/v1/messages", {}),
+      /ECONNREFUSED/,
+    );
+  });
 });
 
 describe("generateRoast provider priority", () => {
@@ -311,6 +432,54 @@ describe("generateRoast provider priority", () => {
     assert.equal(calls[0]!.url, "https://api.openai.com/v1/chat/completions");
     assert.equal(calls[0]!.body.model, PAID_MODEL);
     assert.equal(calls[0]!.body.max_completion_tokens, 2_048);
+  });
+
+  it("keeps the usual temperature until the operator declares a reasoning model", async () => {
+    const calls = stubFetch(() => jsonResponse(openAiPayload()));
+
+    await generateRoast(
+      fakeEnv({ OPENAI_API_KEY: "sk-test", OPENAI_MODEL: PAID_MODEL }),
+      INPUT,
+    );
+
+    assert.equal(calls[0]!.body.temperature, 0.9);
+
+    const reasoningCalls = stubFetch(() => jsonResponse(openAiPayload()));
+
+    await generateRoast(
+      fakeEnv({
+        OPENAI_API_KEY: "sk-test",
+        OPENAI_MODEL: PAID_MODEL,
+        OPENAI_REASONING_EFFORT: "low",
+      }),
+      INPUT,
+    );
+
+    assert.equal(reasoningCalls[0]!.body.temperature, undefined);
+    assert.equal(reasoningCalls[0]!.body.reasoning_effort, "low");
+  });
+
+  it("keeps the paid provider when its gateway refuses a field", async () => {
+    const env = fakeEnv({
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_MODEL: PAID_MODEL,
+      OPENAI_REASONING_EFFORT: "low",
+    });
+    const calls = stubFetch((call, index) =>
+      call.url.includes("api.openai.com") && index === 0
+        ? jsonResponse(
+            { error: { message: "unknown field `reasoning_effort`" } },
+            400,
+          )
+        : jsonResponse(openAiPayload()),
+    );
+
+    const result = await generateRoast(env, INPUT);
+
+    assert.equal(result.provider, "openai");
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]!.body.reasoning_effort, undefined);
+    assert.equal(calls[1]!.body.model, PAID_MODEL);
   });
 
   it("honours OPENAI_BASE_URL for compatible gateways", async () => {
