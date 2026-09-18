@@ -167,6 +167,24 @@ describe("review state footer", () => {
     const body = `Real roast body${buildRoastFooter("groq", STATE)}`;
     assert.equal(stripRoastFooter(body), "Real roast body");
   });
+
+  it("drops prompt echoes stored by an earlier bad run", () => {
+    const state: RoastState = {
+      v: 1,
+      sha: "731a1989d332e68e6073bfaac331c525f39d12af",
+      findings: [
+        { id: "F1", text: "* PR Title: `feat(roast): add a paid provider`" },
+        { id: "F2", text: "* Author: `@vuongj321`" },
+        { id: "F3", path: "src/a.ts", text: "* `src/a.ts` never retries." },
+      ],
+    };
+    const body = `Roast text${buildRoastFooter("gemma", state)}`;
+    const parsed = readRoastState(body);
+
+    assert.deepEqual(parsed!.findings, [
+      { id: "F3", path: "src/a.ts", text: "* `src/a.ts` never retries." },
+    ]);
+  });
 });
 
 describe("parseFindingsFromRoast", () => {
@@ -188,6 +206,26 @@ Grudging respect.
     assert.equal(findings[0]!.id, "F1");
     assert.equal(findings[0]!.path, "apps/api/src/orgs/orgs.service.ts");
     assert.match(findings[2]!.text, /Bulk-revoke/);
+  });
+
+  it("ignores planning labels and prompt echoes", () => {
+    const dump = `### What I'd send back
+* PR Title: \`feat(roast): add a paid provider\`
+* Author: \`@vuongj321\`
+* Key Changes:
+* *Drafting the specific insults*:
+* \`src/roast.ts\`: the attempts mapping is overkill.
+- \`src/github.ts\`: MAX_PRIOR_ROAST_PAGES is arbitrary.`;
+
+    const findings = parseFindingsFromRoast(dump);
+
+    assert.deepEqual(
+      findings.map((f) => f.text),
+      [
+        "* `src/roast.ts`: the attempts mapping is overkill.",
+        "- `src/github.ts`: MAX_PRIOR_ROAST_PAGES is arbitrary.",
+      ],
+    );
   });
 
   it("returns nothing for an empty or footer-only roast", () => {

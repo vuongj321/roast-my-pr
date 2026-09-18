@@ -4,6 +4,7 @@
 
 import { extractCitedPaths, type PartialFile } from "./diffPack.js";
 import { splitBulletBlocks } from "./pathFilter.js";
+import { isPlanningLabel } from "./responseText.js";
 import type {
   PackCoverage,
   PriorFinding,
@@ -76,6 +77,10 @@ export function readRoastState(
                   typeof (f as PriorFinding).text === "string",
               ),
           )
+          // State written by a planning dump holds prompt echoes ("PR Title: …")
+          // rather than findings; carrying them forward asks the next roast to
+          // report them resolved or still present.
+          .filter((f) => !isPlanningLabel(f.text))
           .slice(0, MAX_PRIOR_FINDINGS + 8)
           .map((f) => ({
             id: f.id,
@@ -125,6 +130,10 @@ export function parseFindingsFromRoast(
     if (findings.length >= maxFindings) break;
     const flat = block.replace(/\s+/g, " ").trim();
     if (!flat) continue;
+    // A planning label is not a finding: storing "* Key Changes:" or
+    // "* PR Title: `feat(roast)…`" makes the next run account for prompt
+    // structure instead of review points.
+    if (isPlanningLabel(flat)) continue;
     findings.push({
       id: `F${findings.length + 1}`,
       path: extractCitedPaths(flat)[0],
