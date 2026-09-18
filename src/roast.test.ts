@@ -111,6 +111,28 @@ function sentPrompt(call: FetchCall): string {
   return messages?.[1]?.content ?? "";
 }
 
+type AiCall = { model: string; inputs: Record<string, unknown> };
+
+/**
+ * Env whose only enabled provider is Workers AI (Gemini key cleared), with a
+ * stubbed binding that records the model and inputs of every call.
+ */
+function aiEnv(
+  calls: AiCall[],
+  handler: (call: AiCall, index: number) => unknown,
+): Env {
+  return fakeEnv({
+    GEMINI_API_KEY: "",
+    AI: {
+      run: async (model: string, inputs: Record<string, unknown>) => {
+        const call: AiCall = { model, inputs };
+        calls.push(call);
+        return handler(call, calls.length - 1);
+      },
+    } as unknown as Env["AI"],
+  });
+}
+
 beforeEach(() => {
   // The provider chain is chatty on purpose; keep the test output readable.
   console.error = () => {};
@@ -371,9 +393,10 @@ describe("generateRoast provider priority", () => {
     assert.match(calls[0]!.url, /generativelanguage\.googleapis\.com/);
   });
 
-  it("falls through when the paid model returns unusable output", async () => {
+  it("falls through when the paid model dumps planning notes", async () => {
     const env = fakeEnv({ OPENAI_API_KEY: "sk-test", OPENAI_MODEL: PAID_MODEL });
-    // A planning dump: responseText rejects it as chain-of-thought, not a roast.
+    // A planning dump: responseText rejects it as chain-of-thought, and it is not
+    // a size problem, so there is no pointless 50% retry (or second invoice).
     const notes = "**Role:** reviewer\n**Constraint 1**: stay blunt.";
     const calls = stubFetch((call) =>
       call.url.includes("api.openai.com")
@@ -384,9 +407,24 @@ describe("generateRoast provider priority", () => {
     const result = await generateRoast(env, INPUT);
 
     assert.equal(result.provider, "gemini");
-    // Two paid attempts (empty completion, then a 50% retry) before the cascade.
-    assert.equal(calls.length, 3);
-    assert.match(calls[2]!.url, /generativelanguage\.googleapis\.com/);
+    assert.equal(calls.length, 2);
+    assert.match(calls[1]!.url, /generativelanguage\.googleapis\.com/);
+  });
+
+  it("still shrink-retries the paid provider on an empty completion", async () => {
+    const env = fakeEnv({ OPENAI_API_KEY: "sk-test", OPENAI_MODEL: PAID_MODEL });
+    const calls = stubFetch((call, index) =>
+      call.url.includes("api.openai.com")
+        ? index === 0
+          ? jsonResponse({ choices: [{ message: { content: "" } }] })
+          : jsonResponse(openAiPayload())
+        : jsonResponse(geminiPayload()),
+    );
+
+    const result = await generateRoast(env, INPUT);
+
+    assert.equal(result.provider, "openai");
+    assert.equal(calls.length, 2);
   });
 
   it("reports a quota error when every provider is rate limited", async () => {
@@ -398,5 +436,50 @@ describe("generateRoast provider priority", () => {
     await assert.rejects(() => generateRoast(env, INPUT), {
       name: "RoastQuotaError",
     });
+  });
+});
+
+describe("Workers AI reasoning control", () => {
+  /** The shape of the PR #4 leak: prompt metadata plus planning labels. */
+  const NOTES = `*   PR Title: \`feat(roast): add a paid provider\`
+*   *Drafting the specific insults*:
+*   *Closer*: "Ship it."
+        Actually, it's not that bad. I'll focus on the builder execution.`;
+
+  it("turns thinking off for reasoning families and posts the roast", async () => {
+    const calls: AiCall[] = [];
+    const env = aiEnv(calls, () => ({ response: ROAST }));
+
+    const result = await generateRoast(env, INPUT);
+
+    assert.equal(result.provider, "workersai");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.model, "@cf/google/gemma-4-26b-a4b-it");
+    assert.deepEqual(calls[0]!.inputs.thinking, { type: "disabled" });
+  });
+
+  it("retries without the control when the model rejects it", async () => {
+    const calls: AiCall[] = [];
+    const env = aiEnv(calls, (_call, index) => {
+      if (index === 0) throw new Error("Unknown parameter: thinking");
+      return { response: ROAST };
+    });
+
+    const result = await generateRoast(env, INPUT);
+
+    assert.equal(result.provider, "workersai");
+    assert.equal(calls.length, 2);
+    assert.equal("thinking" in calls[1]!.inputs, false);
+  });
+
+  it("rejects planning notes without a pointless shrink retry", async () => {
+    const calls: AiCall[] = [];
+    const env = aiEnv(calls, () => ({ response: NOTES }));
+
+    await assert.rejects(() => generateRoast(env, INPUT), {
+      name: "RoastError",
+      message: /planning notes/,
+    });
+    assert.equal(calls.length, 1);
   });
 });

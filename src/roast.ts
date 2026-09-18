@@ -15,9 +15,11 @@ import {
 } from "./prompts.js";
 import {
   extractModelText,
+  isPlanningDump,
   isTruncatedRoastText,
   isUsableRoastText,
   logEmptyCompletionPayload,
+  rawAnswerText,
 } from "./responseText.js";
 import type { PackCoverage, PriorFinding } from "./types.js";
 
@@ -435,6 +437,28 @@ function logOpenAiUsage(provider: string, data: OpenAIChatResponse): void {
   }
 }
 
+/**
+ * Distinguish "the model answered with its scratchpad" from "the model answered
+ * with nothing". Only the latter is worth a 50%-budget retry — and on the paid
+ * provider, a second invoice.
+ */
+function unusableOutputError(provider: string, data: unknown): Error {
+  const planning = isPlanningDump(rawAnswerText(data));
+  return Object.assign(
+    new Error(
+      planning
+        ? `${provider} returned its planning notes, not a roast.`
+        : `${provider} returned an empty roast.`,
+    ),
+    {
+      quotaLike: false,
+      tooLarge: false,
+      emptyCompletion: !planning,
+      planningDump: planning,
+    },
+  );
+}
+
 export async function callOpenAICompatible(options: {
   provider: string;
   url: string;
@@ -498,13 +522,57 @@ export async function callOpenAICompatible(options: {
   const text = extractModelText(data);
   if (!text) {
     logEmptyCompletionPayload(options.provider, data);
-    throw Object.assign(
-      new Error(`${options.provider} returned an empty roast.`),
-      { quotaLike: false, tooLarge: false, emptyCompletion: true },
-    );
+    throw unusableOutputError(options.provider, data);
   }
 
   return text;
+}
+
+/**
+ * Reasoning families on Workers AI write a plan before the roast. Gemma did
+ * exactly that on PR #4: the planning text landed in the answer field and got
+ * posted as the review. GLM and Gemma default thinking on, so turn it off.
+ */
+function workersAiThinkingControl(model: string): Record<string, unknown> {
+  return /glm|gemma|qwen/i.test(model) ? { thinking: { type: "disabled" } } : {};
+}
+
+/** Chat-template controls are per-model; drop ours if this model rejects it. */
+function isUnsupportedParameterError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return /unsupported|not supported|unknown (?:field|parameter)|unrecognized|invalid (?:field|parameter)|extra (?:inputs|fields)/i.test(
+    message,
+  );
+}
+
+/**
+ * Run a Workers AI model, retrying once without the thinking control when the
+ * model does not accept it — a rejected control must not drop the provider out
+ * of the chain.
+ */
+async function runWorkersAi(
+  env: Env,
+  model: string,
+  inputs: Record<string, unknown>,
+): Promise<unknown> {
+  try {
+    return await env.AI!.run(
+      model as Parameters<Ai["run"]>[0],
+      inputs as Parameters<Ai["run"]>[1],
+    );
+  } catch (err) {
+    if ("thinking" in inputs && isUnsupportedParameterError(err)) {
+      const { thinking: _thinking, ...withoutControl } = inputs;
+      console.error(
+        `Roast Workers AI: ${model} rejected the thinking control, retrying without it`,
+      );
+      return await env.AI!.run(
+        model as Parameters<Ai["run"]>[0],
+        withoutControl as Parameters<Ai["run"]>[1],
+      );
+    }
+    throw err;
+  }
 }
 
 async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
@@ -525,25 +593,15 @@ async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
       ],
       max_tokens: 2048,
       temperature: 0.9,
+      ...workersAiThinkingControl(model),
     };
-    // GLM defaults thinking on; disable when using that family.
-    if (/glm/i.test(model)) {
-      inputs.thinking = { type: "disabled" };
-    }
 
-    const raw = await env.AI.run(
-      model as Parameters<Ai["run"]>[0],
-      inputs as Parameters<Ai["run"]>[1],
-    );
+    const raw = await runWorkersAi(env, model, inputs);
 
     const text = extractModelText(raw);
     if (!text) {
       logEmptyCompletionPayload("Workers AI", raw);
-      throw Object.assign(new Error("Workers AI returned an empty roast."), {
-        quotaLike: false,
-        tooLarge: false,
-        emptyCompletion: true,
-      });
+      throw unusableOutputError("Workers AI", raw);
     }
     return text;
   } catch (err) {
@@ -596,6 +654,15 @@ function isEmptyCompletionError(err: unknown): boolean {
   return false;
 }
 
+/** A planning dump is not a size problem, so shrinking the pack cannot help. */
+function isPlanningDumpError(err: unknown): boolean {
+  if (typeof err === "object" && err !== null && "planningDump" in err) {
+    return Boolean((err as { planningDump?: boolean }).planningDump);
+  }
+  if (err instanceof Error) return /planning notes/i.test(err.message);
+  return false;
+}
+
 /**
  * Call a provider; on prompt-too-large or empty completion, shrink and retry once.
  * Returns roast text plus the packed filenames used for path filtering.
@@ -617,9 +684,12 @@ async function runWithShrinkRetry(
     } catch (err) {
       lastErr = err;
       // Groq free tier is 8k TPM: an empty→shrink retry often rate-limits the
-      // second call. Only shrink there on explicit "too large" errors.
+      // second call. Only shrink there on explicit "too large" errors. A dump of
+      // planning notes is not about prompt size either, so it never shrinks.
       const emptyOkToShrink =
-        isEmptyCompletionError(err) && provider !== "groq";
+        isEmptyCompletionError(err) &&
+        !isPlanningDumpError(err) &&
+        provider !== "groq";
       const shouldShrink =
         attempt === 0 && (isTooLargeError(err) || emptyOkToShrink);
       if (shouldShrink) {
