@@ -23,12 +23,13 @@ export type CommentOrder = "asc" | "desc";
  * `order` must describe the page it is handed: `asc` (oldest→newest, the REST
  * default) means "keep the last match"; `desc` (newest→oldest) means "keep the
  * first". Passing the wrong order silently selects a stale roast, which is how
- * review memory went stale on PRs with a long comment history.
+ * review memory went stale on PRs with a long comment history — so it is
+ * required rather than defaulted: a caller that forgets cannot compile.
  */
 export function selectLatestPriorRoastComment(
   comments: IssueCommentLike[],
+  order: CommentOrder,
   excludeCommentId?: number,
-  order: CommentOrder = "asc",
 ): { id: number; body: string } | null {
   // Normalize to ascending so there is a single selection rule below.
   const scan = order === "asc" ? comments : [...comments].reverse();
@@ -49,9 +50,13 @@ export function selectLatestPriorRoastComment(
 /** @deprecated Use selectLatestPriorRoastComment */
 export function selectLatestPriorRoast(
   comments: IssueCommentLike[],
+  order: CommentOrder,
   excludeCommentId?: number,
 ): string | null {
-  return selectLatestPriorRoastComment(comments, excludeCommentId)?.body ?? null;
+  return (
+    selectLatestPriorRoastComment(comments, order, excludeCommentId)?.body ??
+    null
+  );
 }
 
 function normalizePrivateKey(pem: string): string {
@@ -356,14 +361,19 @@ export async function fetchLatestPriorRoastComment(
 
     const picked = selectLatestPriorRoastComment(
       data.map((c) => ({ id: c.id, body: c.body })),
-      excludeCommentId,
       "desc",
+      excludeCommentId,
     );
     if (picked) return picked;
 
     // A short page means there is nothing older left to read.
     if (data.length < PRIOR_ROAST_PAGE_SIZE) return null;
   }
+  // "This PR has never been roasted" and "we stopped looking" both return null,
+  // and only one of them loses review memory. Say which one it is.
+  console.error(
+    `Prior roast lookup gave up after ${MAX_PRIOR_ROAST_PAGES} pages of ${PRIOR_ROAST_PAGE_SIZE} comments with no roast comment; treating this PR as never roasted.`,
+  );
   return null;
 }
 
