@@ -83,8 +83,10 @@ npx wrangler secret put PRIVATE_KEY
 npx wrangler secret put GEMINI_API_KEY
 # Optional Groq last-resort failover:
 npx wrangler secret put GROQ_API_KEY
-# Optional paid provider (OPENAI_MODEL is a var in wrangler.toml, not a secret):
+# Optional paid provider. The template ships no OPENAI_* values, so opt in with
+# both halves — a key without a model is ignored:
 npx wrangler secret put OPENAI_API_KEY
+npx wrangler secret put OPENAI_MODEL
 ```
 
 If you previously used OpenRouter, remove the stale secret:
@@ -107,7 +109,7 @@ Optional vars in `wrangler.toml` (not secret):
 | `DAILY_ROAST_LIMIT` | `20` | Soft per-installation daily cap |
 | `MAX_DIFF_CHARS` | `48000` | Ceiling on packed diff size — raise it for the paid provider's 120k budget to take effect |
 
-**Paid provider (optional).** Set **both** `OPENAI_API_KEY` (secret) and `OPENAI_MODEL` (var) to put a paid, OpenAI-shaped endpoint first in the chain. A key without a model is ignored with a warning in the Worker logs, and there is no default model — paid use is always explicit. Any OpenAI-compatible gateway works via `OPENAI_BASE_URL`. Reasoning models reject a non-default `temperature`, so the paid path sends none and caps output with `max_completion_tokens` (use `OPENAI_MAX_TOKENS_FIELD` for older models or odd gateways); `OPENAI_REASONING_EFFORT` is optional. The paid call logs the token usage the provider reports, so spend is visible in `wrangler tail`. Anything that fails — bad key, quota, or two oversized prompts — falls through to the free tiers.
+**Paid provider (optional).** Set **both** `OPENAI_API_KEY` (secret) and `OPENAI_MODEL` (var) to put a paid, OpenAI-shaped endpoint first in the chain. A key without a model is ignored with a warning in the Worker logs, and there is no default model: the shipped `wrangler.toml` carries every `OPENAI_*` value commented out (see the block under `[vars]`), so deploying this template as-is never sends a diff to a paid vendor. Paid use is always explicit. Any OpenAI-compatible gateway works via `OPENAI_BASE_URL`. Reasoning models reject a non-default `temperature`, so the paid path sends none and caps output with `max_completion_tokens` (use `OPENAI_MAX_TOKENS_FIELD` for older models or odd gateways); `OPENAI_REASONING_EFFORT` is optional. The paid call logs the token usage the provider reports, so spend is visible in `wrangler tail`. Anything that fails — bad key, quota, or two oversized prompts — falls through to the free tiers.
 
 Provider order: **OpenAI (paid, if configured) → Gemini → Workers AI → Groq**. Workers AI runs when the `AI` binding is present; Groq is skipped if its API key is unset. Groq is last because its free-tier pack is tiny and weak models invent claims on thin slices. Workers AI reasoning families (Gemma, GLM, Qwen) are called with `thinking: { type: "disabled" }` — retried once without it if a model rejects the control — so the plan stays out of the answer, and any reply that still reads as planning or lacks the roast structure is discarded instead of posted.
 

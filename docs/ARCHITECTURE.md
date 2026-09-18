@@ -264,7 +264,7 @@ Secrets live in Cloudflare Worker secrets (or local `.dev.vars` for development)
 - `WEBHOOK_SECRET`
 - `GEMINI_API_KEY`
 - `GROQ_API_KEY` (optional failover)
-- `OPENAI_API_KEY` (optional paid provider — ignored unless `OPENAI_MODEL` is also set; `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_REASONING_EFFORT`, and `OPENAI_MAX_TOKENS_FIELD` are non-secret vars)
+- `OPENAI_API_KEY` (optional paid provider — ignored unless `OPENAI_MODEL` is also set; `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_REASONING_EFFORT`, and `OPENAI_MAX_TOKENS_FIELD` go in `wrangler.toml` `[vars]` or as secrets, and the template ships all of them commented out)
 - Workers AI uses the wrangler `[ai]` binding (`env.AI`) — no secret. Override model with `WORKERS_AI_MODEL`.
 - If migrating from OpenRouter: `npx wrangler secret delete OPENROUTER_API_KEY`
 

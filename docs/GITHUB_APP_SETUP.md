@@ -72,7 +72,7 @@ Nothing to register on GitHub here. This is just an API key for whichever paid, 
 
 1. Create an API key at your provider (OpenAI, or any gateway that speaks the OpenAI Chat Completions API).
 2. Store it: `npx wrangler secret put OPENAI_API_KEY` for production, `OPENAI_API_KEY=...` in `.dev.vars` for local.
-3. Set `OPENAI_MODEL` (in `wrangler.toml` `[vars]` or as a secret) — there is no default, and the key is ignored without it. Point `OPENAI_BASE_URL` at a non-OpenAI gateway if that is what you use.
+3. Set `OPENAI_MODEL` (in `wrangler.toml` `[vars]` or as a secret) — there is no default, and the template ships it commented out, so the key is ignored until you set it. Point `OPENAI_BASE_URL` at a non-OpenAI gateway if that is what you use.
 4. Optional: `OPENAI_REASONING_EFFORT` (`low`/`medium`/`high`) and `OPENAI_MAX_TOKENS_FIELD`.
 
 Leave every `OPENAI_*` value unset for free-tier-only operation — the bot then behaves exactly as it does without this feature.
