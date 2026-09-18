@@ -2,14 +2,14 @@
 
 Self-hosted GitHub App that roasts pull requests when someone comments `/roastmypr`.
 
-Runs on **Cloudflare Workers** (free tier) with free-tier LLMs: **Google Gemini** (primary), **Workers AI**, then optional **Groq** as last resort. No paid APIs required. Account-only install: your App only works on your account’s repos. Anyone else who wants the bot should clone this repo and deploy their own copy.
+Runs on **Cloudflare Workers** (free tier) with free-tier LLMs: **Google Gemini** (primary), **Workers AI**, then optional **Groq** as last resort. An optional **paid OpenAI-compatible endpoint** can be put first in the chain for sharper reviews. No paid APIs required. Account-only install: your App only works on your account’s repos. Anyone else who wants the bot should clone this repo and deploy their own copy.
 
 ## How it works
 
 1. You comment `/roastmypr` on a PR (first line of the comment).
 2. GitHub sends an `issue_comment` webhook to your Worker.
 3. The Worker verifies the signature, loads the PR diff, and reads the review state left by the previous roast (reviewed SHA + findings).
-4. It calls Gemini, falling back to Workers AI then Groq whenever a provider fails or returns nothing usable, and posts the roast. The footer carries fresh state, so the next roast knows what it already said.
+4. It calls the provider chain — an optional paid OpenAI-compatible endpoint first, then Gemini, Workers AI, Groq — falling through whenever a provider fails or returns nothing usable, and posts the roast. The footer carries fresh state, so the next roast knows what it already said.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deep dive.
 
@@ -36,6 +36,7 @@ Comment `/roastmypr` as the first line of a PR comment to get a full roast revie
 - A GitHub account
 - A [Google AI Studio](https://aistudio.google.com/apikey) API key (free tier)
 - Optional: [Groq](https://console.groq.com/keys) API key for last-resort failover
+- Optional: a paid OpenAI (or OpenAI-compatible) API key **and** model id, to review with a stronger model first
 
 ### 1. Clone and install
 
@@ -68,6 +69,7 @@ Put the returned ids into [`wrangler.toml`](wrangler.toml) under `[[kv_namespace
 - `PRIVATE_KEY` (PKCS#8 PEM)
 - `GEMINI_API_KEY`
 - `GROQ_API_KEY` (optional)
+- `OPENAI_API_KEY` **and** `OPENAI_MODEL` (optional paid; set both or they are ignored)
 
 Workers AI is enabled by the `[ai]` binding in `wrangler.toml` (no secret).
 
@@ -80,6 +82,8 @@ npx wrangler secret put PRIVATE_KEY
 npx wrangler secret put GEMINI_API_KEY
 # Optional Groq last-resort failover:
 npx wrangler secret put GROQ_API_KEY
+# Optional paid provider (OPENAI_MODEL is a var in wrangler.toml, not a secret):
+npx wrangler secret put OPENAI_API_KEY
 ```
 
 If you previously used OpenRouter, remove the stale secret:
@@ -95,12 +99,18 @@ Optional vars in `wrangler.toml` (not secret):
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Primary model id (AI Studio free tier) |
 | `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq last-resort model |
 | `WORKERS_AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Workers AI fallback model |
+| `OPENAI_MODEL` | *(none)* | Required whenever `OPENAI_API_KEY` is set — there is no default (e.g. `gpt-5.6-terra`) |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Paid provider base URL; any OpenAI-shaped gateway works |
+| `OPENAI_REASONING_EFFORT` | *(unset)* | Sent as `reasoning_effort` for reasoning models (`low`, `medium`, `high`) |
+| `OPENAI_MAX_TOKENS_FIELD` | `max_completion_tokens` | Token-cap field for the paid provider; use `max_tokens` for older models or `omit` |
 | `DAILY_ROAST_LIMIT` | `20` | Soft per-installation daily cap |
-| `MAX_DIFF_CHARS` | `48000` | Ceiling on packed diff size (per-provider budgets are lower for Groq) |
+| `MAX_DIFF_CHARS` | `48000` | Ceiling on packed diff size — raise it for the paid provider's 120k budget to take effect |
 
-Failover order: **Gemini → Workers AI → Groq**. Workers AI runs when the `AI` binding is present; Groq is skipped if its API key is unset. Groq is last because its free-tier pack is tiny and weak models invent claims on thin slices.
+**Paid provider (optional).** Set **both** `OPENAI_API_KEY` (secret) and `OPENAI_MODEL` (var) to put a paid, OpenAI-shaped endpoint first in the chain. A key without a model is ignored with a warning in the Worker logs, and there is no default model — paid use is always explicit. Any OpenAI-compatible gateway works via `OPENAI_BASE_URL`. Reasoning models reject a non-default `temperature`, so the paid path sends none and caps output with `max_completion_tokens` (use `OPENAI_MAX_TOKENS_FIELD` for older models or odd gateways); `OPENAI_REASONING_EFFORT` is optional. The paid call logs the token usage the provider reports, so spend is visible in `wrangler tail`. Anything that fails — bad key, quota, or two oversized prompts — falls through to the free tiers.
 
-Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized (within a tier, deleted files, renames, and high-signal paths such as `package.json`, `env.*`/`schema.*`, and controllers come before same-tier touches), and each provider gets a budget that fits its free-tier limits. Within a file the packer keeps the **added-code-dense hunks** (the ones where fixes live) and marks the file `[partial: 3 of 8 hunks]`, so a 12 KB file no longer loses its last functions to a tail truncation. If a provider rejects the prompt as too large — or, on Gemini and Workers AI, returns an empty completion — the Worker shrinks the pack 50% and retries once. Groq skips the empty-completion retry so a second call does not blow its 8K TPM minute. The "changes since your last review" diff is carved out of the same budget, so review memory never inflates the prompt.
+Provider order: **OpenAI (paid, if configured) → Gemini → Workers AI → Groq**. Workers AI runs when the `AI` binding is present; Groq is skipped if its API key is unset. Groq is last because its free-tier pack is tiny and weak models invent claims on thin slices.
+
+Diffs are **packed per provider**: noisy files (lockfiles, images, `dist/`, etc.) are skipped, source is prioritized (within a tier, deleted files, renames, and high-signal paths such as `package.json`, `env.*`/`schema.*`, and controllers come before same-tier touches), and each provider gets a budget that fits its free-tier limits. Within a file the packer keeps the **added-code-dense hunks** (the ones where fixes live) and marks the file `[partial: 3 of 8 hunks]`, so a 12 KB file no longer loses its last functions to a tail truncation. If a provider rejects the prompt as too large — or, on Gemini and Workers AI, returns an empty completion — the Worker shrinks the pack 50% and retries once. Groq skips the empty-completion retry so a second call does not blow its 8K TPM minute. The paid provider gets the biggest budget (120,000 chars of diff), but `MAX_DIFF_CHARS` is still the ceiling — raise it (e.g. to `120000`) if you want the paid run to use that headroom. The "changes since your last review" diff is carved out of the same budget, so review memory never inflates the prompt.
 
 ### 5. Run locally
 
@@ -124,7 +134,8 @@ Send a **ping** from the App settings to confirm delivery.
 
 ## Privacy / free-tier notes
 
-- PR diffs are sent to Gemini first; on failover they may also go to Groq and/or Workers AI. Check each provider’s free-tier terms (prompts may be used to improve products).
+- With a paid provider configured, PR diffs go to **your paid vendor first** (OpenAI, or whatever `OPENAI_BASE_URL` points at). That vendor's data policy applies and you pay per token.
+- Otherwise — and whenever the paid call fails — diffs go to Gemini, and may also reach Groq and/or Workers AI. Check each provider’s free-tier terms (prompts may be used to improve products).
 - Workers AI free plan includes **10,000 Neurons/day** (resets UTC midnight).
 - Quotas are yours alone (self-hosted). Soft daily caps in KV reduce accidental burn.
 - Webhook signature verification is mandatory; do not disable it.
@@ -139,7 +150,7 @@ src/
   github.ts          App auth, PR context fetch, comments
   diffPack.ts        Noise filtering, priority ranking, hunk packing, per-provider budgets
   pathFilter.ts      Path filter, evidence/intent gates, F1 accounting, hedge strip
-  roast.ts           LLM client (Gemini → Workers AI → Groq)
+  roast.ts           LLM client (OpenAI → Gemini → Workers AI → Groq)
   responseText.ts    Normalize / extract usable model completions
   prompts.ts         Roast personality, review state, coverage warnings
   rateLimit.ts       KV daily caps
