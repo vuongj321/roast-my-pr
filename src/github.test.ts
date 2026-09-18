@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  fetchLatestPriorRoastComment,
   isRoastBotComment,
   selectLatestPriorRoast,
   selectLatestPriorRoastComment,
   truncateCommitSubject,
   commitSubjectsFromMessages,
   MAX_COMMIT_MESSAGES,
+  MAX_PRIOR_ROAST_PAGES,
   MAX_COMMIT_SUBJECT_CHARS,
 } from "./github.js";
 import { ROAST_FOOTER_MARKER, buildRoastFooter, readRoastState } from "./prompts.js";
@@ -120,5 +122,136 @@ describe("commitSubjectsFromMessages", () => {
     const subjects = commitSubjectsFromMessages(messages);
     assert.equal(subjects.length, MAX_COMMIT_MESSAGES);
     assert.equal(subjects[0], "commit 0");
+  });
+});
+
+describe("selectLatestPriorRoastComment order contract", () => {
+  it("keeps the first match on a newest-first page", () => {
+    const picked = selectLatestPriorRoastComment(
+      [
+        { id: 30, body: `newest${buildRoastFooter("groq")}` },
+        { id: 20, body: `older${buildRoastFooter("gemini-3.6-flash")}` },
+      ],
+      undefined,
+      "desc",
+    );
+    assert.equal(picked?.id, 30);
+  });
+});
+
+describe("fetchLatestPriorRoastComment", () => {
+  type Listed = { id: number; body: string | null };
+  type RepoClient = Parameters<typeof fetchLatestPriorRoastComment>[0];
+
+  const roastBody = (label: string) =>
+    `${label}${buildRoastFooter("gemini-3.6-flash")}`;
+
+  /** 100-comment pages of non-roast chatter, newest first. */
+  const chatter = (start: number, count = 100): Listed[] =>
+    Array.from({ length: count }, (_, i) => ({
+      id: start + i,
+      body: "chatter",
+    }));
+
+  function stubOctokit(pages: Listed[][]) {
+    const calls: Array<{ page?: number; direction?: string }> = [];
+    const octokit = {
+      rest: {
+        issues: {
+          listComments: async (params: {
+            page?: number;
+            direction?: string;
+          }) => {
+            calls.push(params);
+            return { data: pages[(params.page ?? 1) - 1] ?? [] };
+          },
+        },
+      },
+    };
+    return { octokit: octokit as unknown as RepoClient, calls };
+  }
+
+  it("asks for newest-first pages and returns the newest roast", async () => {
+    const { octokit, calls } = stubOctokit([
+      [{ id: 501, body: roastBody("newest") }, { id: 498, body: "lgtm" }],
+    ]);
+
+    const picked = await fetchLatestPriorRoastComment(
+      octokit,
+      "acme",
+      "widgets",
+      7,
+    );
+
+    assert.equal(picked?.id, 501);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.direction, "desc");
+    assert.equal(calls[0]!.page, 1);
+  });
+
+  it("keeps walking when the newest roast sits deeper in the thread", async () => {
+    // Regression: 200 chatter comments, then the roast. The old ascending scan
+    // of the first 200 comments could never reach it on a long PR.
+    const { octokit, calls } = stubOctokit([
+      chatter(900),
+      chatter(800),
+      [{ id: 5, body: roastBody("older roast") }],
+    ]);
+
+    const picked = await fetchLatestPriorRoastComment(
+      octokit,
+      "acme",
+      "widgets",
+      7,
+    );
+
+    assert.equal(picked?.id, 5);
+    assert.deepEqual(
+      calls.map((c) => c.page),
+      [1, 2, 3],
+    );
+  });
+
+  it("stops at a short page instead of paginating forever", async () => {
+    const { octokit, calls } = stubOctokit([[{ id: 9, body: "lgtm" }]]);
+
+    assert.equal(
+      await fetchLatestPriorRoastComment(octokit, "acme", "widgets", 7),
+      null,
+    );
+    assert.equal(calls.length, 1);
+  });
+
+  it("gives up after the page cap", async () => {
+    const { octokit, calls } = stubOctokit([
+      chatter(900),
+      chatter(800),
+      chatter(700),
+    ]);
+
+    assert.equal(
+      await fetchLatestPriorRoastComment(octokit, "acme", "widgets", 7),
+      null,
+    );
+    assert.equal(calls.length, MAX_PRIOR_ROAST_PAGES);
+  });
+
+  it("keeps looking past an excluded roast", async () => {
+    const page1 = [{ id: 42, body: roastBody("triggering") }, ...chatter(900, 99)];
+    const { octokit, calls } = stubOctokit([
+      page1,
+      [{ id: 7, body: roastBody("prior") }],
+    ]);
+
+    const picked = await fetchLatestPriorRoastComment(
+      octokit,
+      "acme",
+      "widgets",
+      7,
+      42,
+    );
+
+    assert.equal(picked?.id, 7);
+    assert.equal(calls.length, 2);
   });
 });

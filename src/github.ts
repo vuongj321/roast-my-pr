@@ -13,16 +13,27 @@ export function isRoastBotComment(body: string | null | undefined): boolean {
   return Boolean(body && body.includes(ROAST_FOOTER_MARKER));
 }
 
+/** Order in which the API returned the comments we are scanning. */
+export type CommentOrder = "asc" | "desc";
+
 /**
- * Pick the most recent prior roast comment (oldest→newest order).
- * Returns the comment id too, so callers can read its embedded state.
+ * Pick the most recent prior roast comment. Returns the comment id too, so
+ * callers can read its embedded state.
+ *
+ * `order` must describe the page it is handed: `asc` (oldest→newest, the REST
+ * default) means "keep the last match"; `desc` (newest→oldest) means "keep the
+ * first". Passing the wrong order silently selects a stale roast, which is how
+ * review memory went stale on PRs with a long comment history.
  */
 export function selectLatestPriorRoastComment(
   comments: IssueCommentLike[],
   excludeCommentId?: number,
+  order: CommentOrder = "asc",
 ): { id: number; body: string } | null {
+  // Normalize to ascending so there is a single selection rule below.
+  const scan = order === "asc" ? comments : [...comments].reverse();
   let latest: { id: number; body: string } | null = null;
-  for (const comment of comments) {
+  for (const comment of scan) {
     if (
       excludeCommentId !== undefined &&
       comment.id === excludeCommentId
@@ -305,44 +316,55 @@ export async function fetchReviewDelta(
   }
 }
 
+/** Comments requested per page while hunting for the newest prior roast. */
+export const PRIOR_ROAST_PAGE_SIZE = 100;
+
 /**
- * Load the latest prior Roast my PR comment (footer-marked) with its id, so the
+ * How many pages of newest-first comments we will walk before giving up. A PR
+ * whose newest roast is buried deeper than this is treated as having no prior
+ * review rather than stalling the Worker.
+ */
+export const MAX_PRIOR_ROAST_PAGES = 3;
+
+/**
+ * Load the newest prior Roast my PR comment (footer-marked) with its id, so the
  * caller can also read the review state hidden in its footer.
- * Caps at ~100 comments to keep Worker latency bounded.
+ *
+ * Walked newest-first (`direction: "desc"`) and stopped at the first roast. The
+ * previous version read pages 1-2 of the REST default ordering (oldest→newest)
+ * and kept the last match, so on a PR with more than 200 comments it never saw
+ * the newest roast: review memory stayed pinned to an old SHA and the delta
+ * spanned everything since that older review.
  */
 export async function fetchLatestPriorRoastComment(
-  octokit: Octokit,
+  octokit: Pick<Octokit, "rest">,
   owner: string,
   repo: string,
   issueNumber: number,
   excludeCommentId?: number,
 ): Promise<{ id: number; body: string } | null> {
-  const comments: IssueCommentLike[] = [];
-  const perPage = 100;
-  const { data } = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number: issueNumber,
-    per_page: perPage,
-    page: 1,
-  });
-  for (const c of data) {
-    comments.push({ id: c.id, body: c.body });
-  }
-  // One page is enough for typical PRs; if full, take one more page of newest.
-  if (data.length === perPage) {
-    const { data: page2 } = await octokit.rest.issues.listComments({
+  for (let page = 1; page <= MAX_PRIOR_ROAST_PAGES; page += 1) {
+    const { data } = await octokit.rest.issues.listComments({
       owner,
       repo,
       issue_number: issueNumber,
-      per_page: perPage,
-      page: 2,
+      per_page: PRIOR_ROAST_PAGE_SIZE,
+      page,
+      sort: "created",
+      direction: "desc",
     });
-    for (const c of page2) {
-      comments.push({ id: c.id, body: c.body });
-    }
+
+    const picked = selectLatestPriorRoastComment(
+      data.map((c) => ({ id: c.id, body: c.body })),
+      excludeCommentId,
+      "desc",
+    );
+    if (picked) return picked;
+
+    // A short page means there is nothing older left to read.
+    if (data.length < PRIOR_ROAST_PAGE_SIZE) return null;
   }
-  return selectLatestPriorRoastComment(comments, excludeCommentId);
+  return null;
 }
 
 /** @deprecated Use fetchLatestPriorRoastComment */
