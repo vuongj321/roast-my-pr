@@ -6,6 +6,19 @@ export interface Env {
   GEMINI_MODEL: string;
   GROQ_API_KEY?: string;
   GROQ_MODEL: string;
+  /**
+   * Optional paid OpenAI-compatible provider. Tried first when configured, and
+   * needs OPENAI_MODEL too — a key without a model is skipped with a log line.
+   */
+  OPENAI_API_KEY?: string;
+  /** No default: required whenever OPENAI_API_KEY is set. */
+  OPENAI_MODEL?: string;
+  /** Defaults to https://api.openai.com/v1 — any OpenAI-shaped gateway works. */
+  OPENAI_BASE_URL?: string;
+  /** Optional reasoning_effort for reasoning models (none | low | medium | high). */
+  OPENAI_REASONING_EFFORT?: string;
+  /** Token cap field: max_completion_tokens (default) | max_tokens | omit. */
+  OPENAI_MAX_TOKENS_FIELD?: string;
   /** Workers AI binding from wrangler `[ai]`; present when configured. */
   AI?: Ai;
   WORKERS_AI_MODEL?: string;

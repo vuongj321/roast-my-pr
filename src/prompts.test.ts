@@ -323,5 +323,20 @@ describe("buildPartialReviewNote", () => {
     assert.match(note!, /fallback model \(`groq`\)/);
     assert.match(note!, /Claims outside the packed slice are unverified/);
   });
+
+  it("does not call the paid provider a fallback model", () => {
+    const note = buildPartialReviewNote(
+      {
+        includedFiles: 6,
+        totalFiles: 25,
+        shownChars: 7_000,
+        totalChars: 71_000,
+      },
+      { provider: "openai" },
+    );
+    assert.ok(note);
+    assert.match(note!, /^_Partial review: only 6 of 25 changed files/);
+    assert.doesNotMatch(note!, /fallback model/);
+  });
 });
 

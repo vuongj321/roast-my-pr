@@ -324,8 +324,11 @@ ${truncationNote}${partialNote}${lowCoverageNote}${deltaSection}${findingsSectio
 /** Below this share of changed files, the roast is labelled a partial review. */
 export const PARTIAL_REVIEW_FILE_RATIO = 0.5;
 
+/** Only the free-tier failovers get the "fallback model" wording. */
+const FALLBACK_PROVIDERS = new Set(["workersai", "groq"]);
+
 export type PartialReviewNoteOptions = {
-  /** Winning provider name (gemini / groq / workersai). */
+  /** Winning provider name (openai / gemini / workersai / groq). */
   provider?: string;
   /** True when packing dropped files or hunks. */
   truncated?: boolean;
@@ -351,7 +354,7 @@ export function buildPartialReviewNote(
 
   const pct = totalChars > 0 ? Math.round((shownChars / totalChars) * 100) : 0;
   const provider = (options.provider || "").toLowerCase();
-  const isFallback = provider !== "" && provider !== "gemini";
+  const isFallback = FALLBACK_PROVIDERS.has(provider);
 
   if (isFallback) {
     return `_Partial review via fallback model (\`${provider}\`): only ${includedFiles} of ${totalFiles} changed files fitted the provider's budget (~${pct}% of the diff text). Claims outside the packed slice are unverified._`;

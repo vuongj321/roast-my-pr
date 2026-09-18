@@ -85,6 +85,12 @@ interface OpenAIChatResponse {
   choices?: Array<{
     message?: { content?: string | null };
   }>;
+  /** Present on OpenAI (and most compatible gateways) for cost auditing. */
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
   error?: { message?: string; type?: string; code?: string | number };
 }
 
@@ -265,6 +271,69 @@ function workersAiModel(env: Env): string {
   return env.WORKERS_AI_MODEL || "@cf/google/gemma-4-26b-a4b-it";
 }
 
+/** Paid provider base URL; override for any OpenAI-shaped gateway. */
+function openaiBaseUrl(env: Env): string {
+  const raw = (env.OPENAI_BASE_URL || "").trim() || "https://api.openai.com/v1";
+  return raw.replace(/\/+$/, "");
+}
+
+/**
+ * Which body field carries the output cap. OpenAI's reasoning models expect
+ * `max_completion_tokens`; some compatible gateways still want `max_tokens`.
+ */
+function openaiMaxTokensField(
+  env: Env,
+): "max_tokens" | "max_completion_tokens" | "omit" {
+  const raw = (env.OPENAI_MAX_TOKENS_FIELD || "").trim().toLowerCase();
+  if (raw === "max_tokens" || raw === "omit") return raw;
+  return "max_completion_tokens";
+}
+
+/** The paid provider runs only when both halves of its config are present. */
+function isOpenAiEnabled(env: Env): boolean {
+  return Boolean(env.OPENAI_API_KEY && env.OPENAI_MODEL);
+}
+
+/** Enablement rules, shared by the attempt builders and `enabledProviders`. */
+const PROVIDER_ENABLED: Record<ProviderName, (env: Env) => boolean> = {
+  openai: isOpenAiEnabled,
+  gemini: (env) => Boolean(env.GEMINI_API_KEY),
+  workersai: (env) => Boolean(env.AI),
+  groq: (env) => Boolean(env.GROQ_API_KEY),
+};
+
+/** Provider priority: optional paid endpoint first, then the free tiers. */
+export const PROVIDER_PRIORITY: readonly ProviderName[] = [
+  "openai",
+  "gemini",
+  "workersai",
+  "groq",
+];
+
+/** Providers this env can actually call, in priority order. */
+export function enabledProviders(env: Env): ProviderName[] {
+  return PROVIDER_PRIORITY.filter((name) => PROVIDER_ENABLED[name](env));
+}
+
+/**
+ * A half-configured paid provider is a silent no-op, so say it out loud rather
+ * than quietly reviewing with the free tier.
+ */
+export function providerConfigWarnings(env: Env): string[] {
+  const warnings: string[] = [];
+  if (env.OPENAI_API_KEY && !env.OPENAI_MODEL) {
+    warnings.push(
+      "OPENAI_API_KEY is set but OPENAI_MODEL is missing — paid provider skipped. Set OPENAI_MODEL (e.g. gpt-5.6-terra) or remove the key.",
+    );
+  }
+  if (env.OPENAI_MODEL && !env.OPENAI_API_KEY) {
+    warnings.push(
+      "OPENAI_MODEL is set but OPENAI_API_KEY is missing — paid provider skipped.",
+    );
+  }
+  return warnings;
+}
+
 export type RoastResult = {
   text: string;
   provider: ProviderName;
@@ -348,17 +417,48 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
   return text;
 }
 
-async function callOpenAICompatible(options: {
+/** Paid runs should be auditable: log token spend whenever a provider reports it. */
+function logOpenAiUsage(provider: string, data: OpenAIChatResponse): void {
+  const usage = data.usage;
+  if (!usage) return;
+  const parts = [
+    typeof usage.prompt_tokens === "number"
+      ? `prompt=${usage.prompt_tokens}`
+      : null,
+    typeof usage.completion_tokens === "number"
+      ? `completion=${usage.completion_tokens}`
+      : null,
+    typeof usage.total_tokens === "number" ? `total=${usage.total_tokens}` : null,
+  ].filter((part): part is string => Boolean(part));
+  if (parts.length > 0) {
+    console.error(`Roast ${provider} usage: ${parts.join(" ")} tokens`);
+  }
+}
+
+export async function callOpenAICompatible(options: {
   provider: string;
   url: string;
   apiKey: string;
   model: string;
   userPrompt: string;
   maxTokens?: number;
+  /**
+   * Which body field carries the output cap. Defaults to `max_tokens` (Groq);
+   * OpenAI's reasoning models expect `max_completion_tokens`.
+   */
+  maxTokensField?: "max_tokens" | "max_completion_tokens" | "omit";
+  /** Reasoning models reject a non-default temperature, so the paid path omits it. */
+  omitTemperature?: boolean;
   extraHeaders?: Record<string, string>;
   /** Extra OpenAI-compatible body fields (e.g. Groq reasoning controls). */
   extraBody?: Record<string, unknown>;
 }): Promise<string> {
+  const maxTokensField = options.maxTokensField ?? "max_tokens";
+  const tokenCap =
+    maxTokensField === "omit"
+      ? {}
+      : { [maxTokensField]: options.maxTokens ?? 2048 };
+
   const res = await fetch(options.url, {
     method: "POST",
     headers: {
@@ -368,8 +468,8 @@ async function callOpenAICompatible(options: {
     },
     body: JSON.stringify({
       model: options.model,
-      temperature: 0.9,
-      max_tokens: options.maxTokens ?? 2048,
+      ...(options.omitTemperature ? {} : { temperature: 0.9 }),
+      ...tokenCap,
       messages: [
         { role: "system", content: ROAST_SYSTEM_PROMPT },
         { role: "user", content: options.userPrompt },
@@ -379,6 +479,9 @@ async function callOpenAICompatible(options: {
   });
 
   const data = (await res.json()) as OpenAIChatResponse;
+  // Logged before the error checks: a failed call still burns tokens, which
+  // matters most on the paid provider.
+  logOpenAiUsage(options.provider, data);
 
   if (!res.ok) {
     const message =
@@ -539,7 +642,8 @@ async function runWithShrinkRetry(
 }
 
 /**
- * Generate a roast via Gemini, falling back to Workers AI then Groq on failure.
+ * Generate a roast through the provider chain, in PROVIDER_PRIORITY order: the
+ * optional paid OpenAI-compatible endpoint first, then Gemini, Workers AI, Groq.
  * Each provider gets a budget-sized pack of the same PR files (not one shared megaprompt).
  * Groq is last: its 6k pack + weak instruction-following invents claims on thin slices.
  */
@@ -549,16 +653,44 @@ export async function generateRoast(
 ): Promise<RoastResult> {
   const failures: ProviderFailure[] = [];
 
-  const attempts: Array<{
-    name: ProviderName;
-    model: string;
-    enabled: boolean;
-    run: () => Promise<PackedPrompt & { text: string }>;
-  }> = [
-    {
-      name: "gemini",
+  for (const warning of providerConfigWarnings(env)) {
+    console.error(warning);
+  }
+
+  /**
+   * Per-provider call wiring. Order comes from PROVIDER_PRIORITY, so the paid
+   * provider stays first without this map encoding a second ordering.
+   */
+  const builders: Record<
+    ProviderName,
+    () => { model: string; run: () => Promise<PackedPrompt & { text: string }> }
+  > = {
+    openai: () => ({
+      model: env.OPENAI_MODEL || "",
+      run: () =>
+        runWithShrinkRetry(
+          input,
+          "openai",
+          budgetForProvider(env, "openai"),
+          (userPrompt) =>
+            callOpenAICompatible({
+              provider: "OpenAI",
+              url: `${openaiBaseUrl(env)}/chat/completions`,
+              apiKey: env.OPENAI_API_KEY!,
+              model: env.OPENAI_MODEL!,
+              userPrompt,
+              maxTokens: 2_048,
+              maxTokensField: openaiMaxTokensField(env),
+              // Reasoning models only accept the default temperature.
+              omitTemperature: true,
+              extraBody: env.OPENAI_REASONING_EFFORT
+                ? { reasoning_effort: env.OPENAI_REASONING_EFFORT }
+                : undefined,
+            }),
+        ),
+    }),
+    gemini: () => ({
       model: geminiModel(env),
-      enabled: Boolean(env.GEMINI_API_KEY),
       run: () =>
         runWithShrinkRetry(
           input,
@@ -566,11 +698,9 @@ export async function generateRoast(
           budgetForProvider(env, "gemini"),
           (userPrompt) => callGemini(env, userPrompt),
         ),
-    },
-    {
-      name: "workersai",
+    }),
+    workersai: () => ({
       model: workersAiModel(env),
-      enabled: Boolean(env.AI),
       run: () =>
         runWithShrinkRetry(
           input,
@@ -578,11 +708,9 @@ export async function generateRoast(
           budgetForProvider(env, "workersai"),
           (userPrompt) => callWorkersAi(env, userPrompt),
         ),
-    },
-    {
-      name: "groq",
+    }),
+    groq: () => ({
       model: groqModel(env),
-      enabled: Boolean(env.GROQ_API_KEY),
       run: () =>
         runWithShrinkRetry(
           input,
@@ -605,13 +733,28 @@ export async function generateRoast(
               },
             }),
         ),
-    },
-  ];
+    }),
+  };
+
+  const attempts: Array<{
+    name: ProviderName;
+    model: string;
+    enabled: boolean;
+    run: () => Promise<PackedPrompt & { text: string }>;
+  }> = PROVIDER_PRIORITY.map((name) => ({
+    name,
+    enabled: PROVIDER_ENABLED[name](env),
+    ...builders[name](),
+  }));
 
   const configured = attempts.filter((a) => a.enabled);
   if (configured.length === 0) {
     throw new RoastError("No AI providers configured.");
   }
+
+  console.error(
+    `Roast provider order: ${configured.map((a) => a.name).join(" → ")}`,
+  );
 
   for (const attempt of configured) {
     try {

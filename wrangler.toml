@@ -24,6 +24,14 @@ DAILY_ROAST_LIMIT = "20"
 # Global ceiling applied on top of per-provider budgets (see src/diffPack.ts).
 MAX_DIFF_CHARS = "48000"
 
+# Optional paid OpenAI-compatible provider. Set BOTH the OPENAI_API_KEY secret
+# and OPENAI_MODEL, or neither — a key without a model is skipped with a warning
+# in the Worker logs. There is no default model.
+# OPENAI_MODEL = "gpt-5.6-terra"
+# OPENAI_BASE_URL = "https://api.openai.com/v1"       # any OpenAI-shaped gateway
+# OPENAI_REASONING_EFFORT = "low"                     # reasoning models only
+# OPENAI_MAX_TOKENS_FIELD = "max_completion_tokens"   # or max_tokens / omit
+
 [observability]
 enabled = true
 
