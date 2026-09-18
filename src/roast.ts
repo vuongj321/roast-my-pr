@@ -342,6 +342,11 @@ export type RoastResult = {
   model: string;
   /** How much of the PR this run actually saw (written to the footer). */
   coverage: PackCoverage;
+  /**
+   * Visible partial-coverage note for the footer, or null when the run saw
+   * everything. Kept out of `text` so the roast body stays the model's answer.
+   */
+  partialNote: string | null;
 };
 
 /** Hard ceiling for one outbound provider request, so a stall cannot hold the webhook open. */
@@ -1035,9 +1040,8 @@ export async function generateRoast(
       }
 
       return {
-        text: coverageNote
-          ? `${coverageNote}\n\n${dehedged.text}`
-          : dehedged.text,
+        text: dehedged.text,
+        partialNote: coverageNote,
         provider: attempt.name,
         model: attempt.model,
         coverage,

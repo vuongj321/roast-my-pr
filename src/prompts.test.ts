@@ -168,6 +168,24 @@ describe("review state footer", () => {
     assert.equal(stripRoastFooter(body), "Real roast body");
   });
 
+  it("renders the coverage note under the attribution, not above the roast", () => {
+    const note = buildPartialReviewNote({
+      includedFiles: 6,
+      totalFiles: 25,
+      shownChars: 7_000,
+      totalChars: 71_000,
+    })!;
+    const body = `Real roast body${buildRoastFooter("groq", STATE, note)}`;
+
+    const attribution = body.indexOf("Reviewed by **Roast my PR**");
+    assert.ok(attribution > -1);
+    assert.ok(body.indexOf(note) > attribution);
+    assert.ok(body.startsWith("Real roast body"));
+    // The next run still reads the state, and neither footer part reaches the model.
+    assert.equal(readRoastState(body)!.sha, STATE.sha);
+    assert.equal(stripRoastFooter(body), "Real roast body");
+  });
+
   it("drops prompt echoes stored by an earlier bad run", () => {
     const state: RoastState = {
       v: 1,

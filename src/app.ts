@@ -161,7 +161,7 @@ export async function handleIssueComment(
       owner,
       repo,
       number,
-      `${roast.text}${buildRoastFooter(roast.model, state)}`,
+      `${roast.text}${buildRoastFooter(roast.model, state, roast.partialNote)}`,
     );
   } catch (err) {
     console.error("Roast failed", formatGithubError(err));

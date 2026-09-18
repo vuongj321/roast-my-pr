@@ -36,12 +36,18 @@ export const MAX_PRIOR_FINDINGS = 8;
 const MAX_FINDING_CHARS = 240;
 
 /**
- * Roast footer, optionally carrying machine-readable review state so the next
- * run knows which SHA was reviewed and what was flagged (with ids).
+ * Roast footer: the attribution line, an optional partial-coverage note under it
+ * (see `buildPartialReviewNote`), and the machine-readable review state so the
+ * next run knows which SHA was reviewed and what was flagged (with ids).
  */
-export function buildRoastFooter(model: string, state?: RoastState): string {
+export function buildRoastFooter(
+  model: string,
+  state?: RoastState,
+  partialNote?: string | null,
+): string {
+  const note = partialNote ? `\n\n${partialNote}` : "";
   const hidden = state ? `\n<!-- ${serializeRoastState(state)} -->` : "";
-  return `\n\n---\n*${ROAST_FOOTER_MARKER} · \`${model}\` · self-hosted free-tier bot*${hidden}`;
+  return `\n\n---\n*${ROAST_FOOTER_MARKER} · \`${model}\` · self-hosted free-tier bot*${note}${hidden}`;
 }
 
 /**
@@ -344,8 +350,10 @@ export type PartialReviewNoteOptions = {
 };
 
 /**
- * Visible banner for runs where the provider budget only covered a fraction of
- * the PR. A confidently narrow review is better than a silently narrow one.
+ * Visible note for runs where the provider budget only covered a fraction of the
+ * PR. A confidently narrow review is better than a silently narrow one, but the
+ * reader is already past the review by then, so it renders under the footer
+ * attribution (`buildRoastFooter`) rather than above the roast.
  */
 export function buildPartialReviewNote(
   coverage: PackCoverage,

@@ -482,6 +482,38 @@ describe("generateRoast provider priority", () => {
     assert.equal(calls[1]!.body.model, PAID_MODEL);
   });
 
+  it("hands the coverage note to the footer instead of the roast body", async () => {
+    const env = fakeEnv({
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_MODEL: PAID_MODEL,
+      MAX_DIFF_CHARS: "20000",
+    });
+    const bigPatch = [
+      "@@ -1,150 +1,150 @@",
+      ...Array.from({ length: 150 }, (_, i) => `-old ${i} ${"x".repeat(80)}`),
+      ...Array.from({ length: 150 }, (_, i) => `+new ${i} ${"x".repeat(80)}`),
+    ].join("\n");
+    const many: RoastInput = {
+      ...INPUT,
+      files: [
+        // The roast cites this path, so the evidence filter keeps its bullets.
+        { filename: "src/a.ts", status: "modified", patch: bigPatch },
+        ...Array.from({ length: 11 }, (_, i) => ({
+          filename: `src/file-${i}.ts`,
+          status: "modified",
+          patch: bigPatch,
+        })),
+      ],
+    };
+    stubFetch(() => jsonResponse(openAiPayload()));
+
+    const result = await generateRoast(env, many);
+
+    assert.ok(result.partialNote, "thin coverage must produce a note");
+    assert.match(result.partialNote!, /^_Partial review/);
+    assert.equal(result.text.includes("Partial review"), false);
+  });
+
   it("honours OPENAI_BASE_URL for compatible gateways", async () => {
     const env = fakeEnv({
       OPENAI_API_KEY: "sk-test",
