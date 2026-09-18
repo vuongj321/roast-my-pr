@@ -40,16 +40,39 @@ const LABEL_ONLY_BULLET_RE = new RegExp(
 /**
  * Bullets labelled with a *process* step rather than a review point. These read
  * as planning ("*Refining \"Fix it\"*:", "*Closer*:", "*Wait, check …*:"), so
- * they mark the whole reply as scratchpad even when it also carries a real
- * section heading — which is exactly how a planning dump slipped out as a roast.
+ * a cluster of them is what a planning dump looks like.
  */
 const PLANNING_LABEL_WORDS =
   "drafts?|drafting|refin\\w+|reviewing|looking at|closer|wait|key changes|potential issues?|self-?check|summar\\w+";
 
-const PLANNING_LABEL_RE = new RegExp(
-  `${BULLET}\\*{0,2}(?:${PLANNING_LABEL_WORDS})\\b[^*\\n]{0,60}\\*{0,2}:`,
+/**
+ * A bullet that is *nothing but* a process label: `* *Closer*:`, `- Key Changes:`.
+ * Scratchpad structure, not a finding, so it disqualifies on its own.
+ */
+const PLANNING_LABEL_BULLET_RE = new RegExp(
+  `${BULLET}\\*{0,2}(?:${PLANNING_LABEL_WORDS})\\b[^*\\n]{0,60}\\*{0,2}:[\\t ]*$`,
   "im",
 );
+
+/**
+ * Every process label used inside a bullet, content or not, captured so
+ * `planningLabelHits` can count *distinct* ones. A single hit is not planning:
+ * ``- **Reviewing the retry loop:** `src/retry.ts` never resets`` is a normal
+ * finding bullet that happens to start with a process word.
+ */
+const PLANNING_LABEL_ANY_RE = new RegExp(
+  `${BULLET}\\*{0,2}(${PLANNING_LABEL_WORDS})\\b`,
+  "gim",
+);
+
+/** Distinct process labels a reply tells on itself with. */
+function planningLabelHits(text: string): Set<string> {
+  const hits = new Set<string>();
+  for (const match of text.matchAll(PLANNING_LABEL_ANY_RE)) {
+    hits.add(match[1]!.toLowerCase());
+  }
+  return hits;
+}
 
 /**
  * The user prompt's own field names. A bullet repeating "PR Title: …" /
@@ -69,14 +92,15 @@ const PLANNING_NARRATION_RE =
   /\bi'?ll focus\b|\blet me (?:re-?check|re-?read|double-?check)\b|\bwait, (?:check|looking|look)\b|\bactually, (?:it'?s|that'?s|this is) (?:not that bad|fine|readable)\b|\bthis (?:seems|looks) (?:okay|fine|reasonable) but\b/i;
 
 /**
- * True when the text contains a line that is a planning label, a prompt-field
- * echo, or a label-only bullet. Safe to run on a single finding block or on a
- * whole reply.
+ * True when this text is not review content: a bullet that is nothing but a
+ * label, a bullet that is nothing but a process step, or a prompt-field echo.
+ * A process label that carries a finding on the same line is *not* one of these
+ * — `isPlanningDump` is what counts the reply-level signals.
  */
 export function isPlanningLabel(text: string): boolean {
   return (
     LABEL_ONLY_BULLET_RE.test(text) ||
-    PLANNING_LABEL_RE.test(text) ||
+    PLANNING_LABEL_BULLET_RE.test(text) ||
     PROMPT_ECHO_RE.test(text)
   );
 }
@@ -98,22 +122,63 @@ export function looksLikeFinishedRoast(text: string): boolean {
   return false;
 }
 
-/**
- * True when the model dumped planning/CoT instead of the roast markdown format.
- */
-export function isPlanningDump(text: string): boolean {
+/** Step-by-step analysis of the task itself, never part of a posted roast. */
+function looksLikeCot(text: string): boolean {
   const t = text.trim();
-  if (!t) return false;
-
-  const looksLikeCot =
+  return (
     (/analyze the request/i.test(t) && /drafting the response/i.test(t)) ||
     /mental scan for issues/i.test(t) ||
     (/\*\*role:\*\*/i.test(t) && /\*\*constraint\s*\d+/i.test(t)) ||
     /^\s*1\.\s*\*\*analyze/i.test(t) ||
     /we need to produce a roast/i.test(t) ||
-    /let'?s scan (the )?diff/i.test(t);
+    /let'?s scan (the )?diff/i.test(t)
+  );
+}
 
-  return looksLikeCot || isPlanningLabel(t) || PLANNING_NARRATION_RE.test(t);
+/**
+ * Tells that cannot be a finding: a step-by-step analysis of the task, a bullet
+ * that is nothing but a label, or a prompt field echoed back as a bullet. A
+ * finished roast contains none of them, so one is enough.
+ */
+function hasPlanningScaffold(text: string): boolean {
+  return (
+    looksLikeCot(text) ||
+    LABEL_ONLY_BULLET_RE.test(text) ||
+    PLANNING_LABEL_BULLET_RE.test(text) ||
+    PROMPT_ECHO_RE.test(text)
+  );
+}
+
+/**
+ * How many *ambiguous* planning tells a reply needs before we throw it away.
+ * One is a false positive waiting to happen — `- **Reviewing the retry loop:** …`
+ * is a normal finding bullet, and "Actually, it's not that bad." can be a jab —
+ * and on the paid provider a rejected answer is an invoice for a roast nobody
+ * ever sees. Two is scratchpad; `PR4_PLANNING_DUMP` trips several.
+ */
+export const PLANNING_SIGNAL_THRESHOLD = 2;
+
+/**
+ * Ambiguous tells: a process-worded bullet (`planningLabelHits`) or a line of
+ * first-person narration about the review itself.
+ */
+function weakPlanningSignals(text: string): string[] {
+  return [
+    PLANNING_NARRATION_RE.test(text) ? "first-person narration" : "",
+    ...planningLabelHits(text),
+  ].filter(Boolean);
+}
+
+/**
+ * True when the model dumped planning/CoT instead of the roast markdown format.
+ * Unambiguous scaffolding is fatal on sight; the ambiguous tells need two
+ * independent signals (see `PLANNING_SIGNAL_THRESHOLD`).
+ */
+export function isPlanningDump(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  if (hasPlanningScaffold(t)) return true;
+  return weakPlanningSignals(t).length >= PLANNING_SIGNAL_THRESHOLD;
 }
 
 /**
@@ -257,21 +322,42 @@ export function rawAnswerText(data: unknown): string {
   return answerCandidates(data)[0]?.text.trim() ?? "";
 }
 
-/** Log a clipped payload when a provider returns no usable text. */
-export function logEmptyCompletionPayload(
+/** How much of a rejected answer is copied into the Worker log. */
+export const REJECTED_ANSWER_LOG_CHARS = 2_000;
+
+function clipForLog(value: string): string {
+  return value.length > REJECTED_ANSWER_LOG_CHARS
+    ? `${value.slice(0, REJECTED_ANSWER_LOG_CHARS)}…[clipped, ${value.length} chars]`
+    : value;
+}
+
+/**
+ * Log a rejected completion, with the text that was thrown away.
+ *
+ * "The provider returned nothing" and "we decided this was scratchpad" are
+ * different bugs — and on the paid provider both are invoiced — so the reason
+ * and the text both go to the log. Without that, a planning-gate false positive
+ * looks exactly like an empty answer and nobody can tell which one to fix.
+ */
+export function logRejectedAnswer(
   provider: string,
-  data: unknown,
+  reason: string,
+  text: string,
+  data?: unknown,
 ): void {
-  try {
-    const raw = typeof data === "string" ? data : JSON.stringify(data);
-    const clipped =
-      raw.length > 800 ? `${raw.slice(0, 800)}…[clipped]` : raw;
-    console.error(
-      `Roast provider ${provider}: empty completion payload: ${clipped}`,
-    );
-  } catch {
-    console.error(
-      `Roast provider ${provider}: empty completion (unserializable payload)`,
-    );
+  const trimmed = text.trim();
+  let detail: string;
+  if (trimmed) {
+    detail = clipForLog(trimmed);
+  } else {
+    try {
+      detail =
+        data === undefined
+          ? "[no answer text]"
+          : `[no answer text] ${clipForLog(typeof data === "string" ? data : JSON.stringify(data))}`;
+    } catch {
+      detail = "[no answer text, unserializable payload]";
+    }
   }
+  console.error(`Roast provider ${provider}: ${reason} — ${detail}`);
 }

@@ -18,7 +18,7 @@ import {
   isPlanningDump,
   isTruncatedRoastText,
   isUsableRoastText,
-  logEmptyCompletionPayload,
+  logRejectedAnswer,
   rawAnswerText,
 } from "./responseText.js";
 import type { PackCoverage, PriorFinding } from "./types.js";
@@ -405,10 +405,20 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
     truncatedByApi ||
     isTruncatedRoastText(text)
   ) {
-    logEmptyCompletionPayload("Gemini", data);
+    const truncated = truncatedByApi || isTruncatedRoastText(text);
+    logRejectedAnswer(
+      "Gemini",
+      truncated
+        ? "returned a truncated roast"
+        : isPlanningDump(text)
+          ? "returned planning notes, not a roast"
+          : "returned an empty roast",
+      text,
+      data,
+    );
     throw Object.assign(
       new Error(
-        truncatedByApi || isTruncatedRoastText(text)
+        truncated
           ? "Gemini returned a truncated roast."
           : "Gemini returned an empty roast.",
       ),
@@ -521,7 +531,15 @@ export async function callOpenAICompatible(options: {
 
   const text = extractModelText(data);
   if (!text) {
-    logEmptyCompletionPayload(options.provider, data);
+    const answer = rawAnswerText(data);
+    logRejectedAnswer(
+      options.provider,
+      isPlanningDump(answer)
+        ? "returned planning notes, not a roast"
+        : "returned an empty roast",
+      answer,
+      data,
+    );
     throw unusableOutputError(options.provider, data);
   }
 
@@ -600,7 +618,15 @@ async function callWorkersAi(env: Env, userPrompt: string): Promise<string> {
 
     const text = extractModelText(raw);
     if (!text) {
-      logEmptyCompletionPayload("Workers AI", raw);
+      const answer = rawAnswerText(raw);
+      logRejectedAnswer(
+        "Workers AI",
+        isPlanningDump(answer)
+          ? "returned planning notes, not a roast"
+          : "returned an empty roast",
+        answer,
+        raw,
+      );
       throw unusableOutputError("Workers AI", raw);
     }
     return text;

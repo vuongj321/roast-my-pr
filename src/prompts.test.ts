@@ -176,6 +176,11 @@ describe("review state footer", () => {
         { id: "F1", text: "* PR Title: `feat(roast): add a paid provider`" },
         { id: "F2", text: "* Author: `@vuongj321`" },
         { id: "F3", path: "src/a.ts", text: "* `src/a.ts` never retries." },
+        {
+          id: "F4",
+          path: "src/retry.ts",
+          text: "- **Reviewing the retry loop:** `src/retry.ts` never resets.",
+        },
       ],
     };
     const body = `Roast text${buildRoastFooter("gemma", state)}`;
@@ -183,6 +188,11 @@ describe("review state footer", () => {
 
     assert.deepEqual(parsed!.findings, [
       { id: "F3", path: "src/a.ts", text: "* `src/a.ts` never retries." },
+      {
+        id: "F4",
+        path: "src/retry.ts",
+        text: "- **Reviewing the retry loop:** `src/retry.ts` never resets.",
+      },
     ]);
   });
 });
@@ -225,6 +235,20 @@ Grudging respect.
         "* `src/roast.ts`: the attempts mapping is overkill.",
         "- `src/github.ts`: MAX_PRIOR_ROAST_PAGES is arbitrary.",
       ],
+    );
+  });
+
+  it("keeps a finding that opens with a process word", () => {
+    // Same predicate guards the footer state, so an over-broad label match used
+    // to erase legitimate findings from review memory, not just from a reply.
+    const roast = `### What I'd send back
+- **Reviewing the retry loop:** \`src/retry.ts\` never resets the backoff.`;
+
+    const findings = parseFindingsFromRoast(roast);
+
+    assert.deepEqual(
+      findings.map((f) => f.text),
+      ["- **Reviewing the retry loop:** `src/retry.ts` never resets the backoff."],
     );
   });
 

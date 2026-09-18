@@ -3,9 +3,11 @@ import { describe, it } from "node:test";
 import {
   extractModelText,
   isPlanningDump,
+  isPlanningLabel,
   isPostableRoast,
   isTruncatedRoastText,
   isUsableRoastText,
+  logRejectedAnswer,
   looksLikeFinishedRoast,
   rawAnswerText,
 } from "./responseText.js";
@@ -232,6 +234,76 @@ describe("planning dumps", () => {
 `;
     assert.equal(isPlanningDump(roast), false);
     assert.equal(isPostableRoast(roast), true);
+  });
+
+  it("rejects a bullet that is nothing but a process label", () => {
+    assert.equal(isPlanningLabel("* *Drafting the specific insults*:"), true);
+    assert.equal(isPlanningLabel("- Key Changes:"), true);
+    assert.equal(isPlanningDump("* *Drafting the specific insults*:"), true);
+    assert.equal(
+      isPlanningDump("- *Drafting the specific insults*:\n- *Closer*:"),
+      true,
+    );
+  });
+
+  it("needs two independent signals before calling a reply scratchpad", () => {
+    const oneLabel =
+      "* Drafting the specific insults*: the rename does nothing useful.";
+    assert.equal(isPlanningDump(oneLabel), false);
+    assert.equal(isPlanningDump(`${oneLabel}\n* *Closer*: "Ship it."`), true);
+    assert.equal(isPlanningDump(`${oneLabel}\nActually, it's not that bad.`), true);
+  });
+
+  it("keeps a labelled finding that opens with a process word", () => {
+    // The PR #4 review's own example: one process word on a bullet that carries
+    // a finding is not scratchpad, and rejecting it costs a paid answer.
+    const roast = `# Your retry loop is a coin flip
+
+### What I'd send back
+- **Reviewing the retry loop:** \`src/retry.ts\` never resets the backoff after a 429.
+
+### Fix it
+1. Reset the backoff once a call succeeds.
+
+Ship it after the backoff resets.`;
+
+    assert.equal(
+      isPlanningLabel(
+        "- **Reviewing the retry loop:** `src/retry.ts` never resets the backoff.",
+      ),
+      false,
+    );
+    assert.equal(isPlanningDump(roast), false);
+    assert.equal(isPostableRoast(roast), true);
+  });
+});
+
+describe("logRejectedAnswer", () => {
+  it("logs the text that was thrown away, with the reason", () => {
+    const logged: string[] = [];
+    const realConsoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(args.join(" "));
+    };
+    try {
+      logRejectedAnswer(
+        "OpenAI",
+        "returned planning notes, not a roast",
+        "* Drafting the specific insults*: the rename does nothing.",
+        { choices: [] },
+      );
+      logRejectedAnswer("Gemini", "returned an empty roast", "", {
+        candidates: [],
+        promptFeedback: { blockReason: "SAFETY" },
+      });
+    } finally {
+      console.error = realConsoleError;
+    }
+
+    assert.match(logged[0]!, /planning notes, not a roast/);
+    assert.match(logged[0]!, /Drafting the specific insults/);
+    assert.match(logged[1]!, /\[no answer text\]/);
+    assert.match(logged[1]!, /SAFETY/);
   });
 });
 
