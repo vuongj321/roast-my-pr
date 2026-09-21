@@ -367,8 +367,11 @@ export type TimedJsonResponse<T = unknown> = {
  * POST to a provider with a deadline that covers the whole round trip — headers
  * and body. The roast runs inline in the webhook, so a vendor that sends 200 and
  * then stalls mid-body would otherwise hold the comment open while the next
- * provider in the chain would have answered. A timeout is never "quota-like", so
- * the chain keeps walking instead of reporting a rate limit.
+ * provider in the chain would have answered.
+ *
+ * The body is read as text and parsed separately so an HTML 429/502 (proxy page,
+ * interstitial) cannot erase the HTTP status: `quotaLike` is derived from status
+ * (and message) instead of hardcoded false. A timeout is still never quota-like.
  */
 export async function fetchWithTimeout<T = unknown>(
   provider: string,
@@ -378,13 +381,40 @@ export async function fetchWithTimeout<T = unknown>(
 ): Promise<TimedJsonResponse<T>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let status: number | undefined;
   try {
     const res = await fetch(url, { ...init, signal: controller.signal });
+    status = res.status;
     // Read under the same deadline: fetch resolves on headers, and a stalled
     // body is the hang this helper exists to cut short.
-    const data = (await res.json()) as T;
-    return { ok: res.ok, status: res.status, data };
+    const text = await res.text();
+
+    let data: T;
+    try {
+      data = (text.length > 0 ? JSON.parse(text) : {}) as T;
+    } catch {
+      const message = `${provider} HTTP ${status}: response was not JSON.`;
+      throw Object.assign(new Error(message), {
+        quotaLike:
+          isRetryableStatus(status) || isQuotaLikeMessage(`${message} ${text}`),
+        tooLarge: isPromptTooLargeMessage(text),
+        emptyCompletion: false,
+        status,
+      });
+    }
+
+    return { ok: res.ok, status, data };
   } catch (err) {
+    // Non-JSON body errors are already classified with status + quotaLike.
+    if (
+      err instanceof Error &&
+      "quotaLike" in err &&
+      "status" in err &&
+      typeof (err as { status?: unknown }).status === "number"
+    ) {
+      throw err;
+    }
+
     // signal.aborted covers body reads that throw a non-AbortError once the
     // timer fires (cancelled stream / TypeError), not only fetch() itself.
     const aborted =
@@ -395,10 +425,17 @@ export async function fetchWithTimeout<T = unknown>(
       : err instanceof Error
         ? err.message
         : `${provider} request failed.`;
+    // Timeouts never count as quota; other failures keep status when we got one
+    // (e.g. body read failed after headers) so a 429 is not a network blip.
+    const quotaLike = aborted
+      ? false
+      : (status !== undefined && isRetryableStatus(status)) ||
+        isQuotaLikeMessage(message);
     throw Object.assign(new Error(message), {
-      quotaLike: false,
-      tooLarge: false,
+      quotaLike,
+      tooLarge: isPromptTooLargeMessage(message),
       emptyCompletion: false,
+      ...(status !== undefined ? { status } : {}),
     });
   } finally {
     clearTimeout(timer);

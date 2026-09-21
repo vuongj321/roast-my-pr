@@ -484,6 +484,30 @@ describe("fetchWithTimeout", () => {
     assert.deepEqual(result.data, { ok: true, value: 7 });
   });
 
+  it("keeps HTTP status when a rate-limit body is HTML, not JSON", async () => {
+    globalThis.fetch = (async () =>
+      new Response("<html>Too Many Requests</html>", {
+        status: 429,
+        headers: { "content-type": "text/html" },
+      })) as unknown as typeof fetch;
+
+    await assert.rejects(
+      () =>
+        fetchWithTimeout(
+          "OpenAI",
+          "https://api.openai.com/v1/chat/completions",
+          {},
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /HTTP 429.*not JSON/);
+        assert.equal((err as { quotaLike?: boolean }).quotaLike, true);
+        assert.equal((err as { status?: number }).status, 429);
+        return true;
+      },
+    );
+  });
+
   it("reports a connection failure as itself, not as a timeout", async () => {
     globalThis.fetch = (async () => {
       throw new TypeError("fetch failed: ECONNREFUSED");
