@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
  * is a promise to them: nothing is wired to a paid vendor by default, and the
  * globals it sets are the ones the README documents.
  *
- * Both drifts happened on PR #4 — a committed `OPENAI_MODEL` while `src/types.ts`
+ * Both drifts happened on PR #4 â€” a committed `OPENAI_MODEL` while `src/types.ts`
  * and the README said "no default", and a `MAX_DIFF_CHARS` bump that left the
  * README table advertising the old number. These are the guards.
  */
