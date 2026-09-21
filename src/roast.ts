@@ -654,7 +654,6 @@ export async function callOpenAICompatible(options: {
   extraBody?: Record<string, unknown>;
 }): Promise<string> {
   const bodies = paidRequestBodies(options);
-  let refusedField: Error | undefined;
 
   for (let index = 0; index < bodies.length; index += 1) {
     const { ok, status, data } = await fetchWithTimeout<OpenAIChatResponse>(
@@ -686,7 +685,6 @@ export async function callOpenAICompatible(options: {
       // A refused field says nothing about the roast: shed ours, ask again with
       // the plainer body, and keep the paid provider in the chain.
       if (index < bodies.length - 1 && isUnsupportedParameterError(error)) {
-        refusedField = error;
         console.error(
           `Roast provider ${options.provider}: gateway refused a request field (${message}) — retrying with a plainer body`,
         );
@@ -712,10 +710,8 @@ export async function callOpenAICompatible(options: {
     return text;
   }
 
-  throw (
-    refusedField ??
-    new Error(`${options.provider} failed with every request shape.`)
-  );
+  // paidRequestBodies always returns ≥1 shape; each iteration returns or throws.
+  throw new Error(`${options.provider} has no request shapes to try.`);
 }
 
 /**
