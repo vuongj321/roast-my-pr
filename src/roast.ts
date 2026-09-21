@@ -541,14 +541,16 @@ type OpenAiBodyShape = {
 
 /**
  * Bodies to try for one paid call: the configured shape, the same thing without
- * our extra fields, then a bare `model` + `messages` request.
+ * our extra fields, then a plain `model` + `messages` + `max_tokens` request.
  *
  * A gateway can 400 on any field we added — `reasoning_effort` on a
  * non-reasoning model, `max_completion_tokens` on an older or narrower gateway,
  * a non-default `temperature` on a reasoning model — and each of those would
- * otherwise drop the paid provider out of the chain for a whole roast. The
- * plainer request is what every OpenAI-compatible vendor documents as supported.
- * Identical bodies collapse, so an unconfigured paid call still sends one request.
+ * otherwise drop the paid provider out of the chain for a whole roast. The last
+ * shape keeps a classic `max_tokens` ceiling: bare `model` + `messages` with no
+ * cap is what every vendor accepts, but on a paid endpoint an unbounded
+ * completion is a billing incident. Identical bodies collapse, so an
+ * unconfigured paid call still sends one request.
  */
 function paidRequestBodies(options: {
   model: string;
@@ -566,7 +568,8 @@ function paidRequestBodies(options: {
       extraBody: options.extraBody,
     },
     { maxTokensField: capField, temperature: !options.omitTemperature },
-    { maxTokensField: "omit", temperature: false },
+    // Last resort: no extras, no temperature, but always a classic token cap.
+    { maxTokensField: "max_tokens", temperature: false },
   ];
 
   const bodies: Record<string, unknown>[] = [];

@@ -333,7 +333,7 @@ describe("callOpenAICompatible", () => {
     assert.equal(calls[1]!.body.model, PAID_MODEL);
   });
 
-  it("sheds the token cap when the gateway does not know that field", async () => {
+  it("falls back to classic max_tokens when max_completion_tokens is refused", async () => {
     const calls = stubFetch((_call, index) =>
       index === 0
         ? jsonResponse(
@@ -360,8 +360,15 @@ describe("callOpenAICompatible", () => {
     assert.equal(text, ROAST);
     assert.equal(calls.length, 2);
     assert.equal(calls[0]!.body.max_completion_tokens, 2_048);
-    // Last resort is `model` + `messages`, which every gateway accepts.
-    assert.deepEqual(Object.keys(calls[1]!.body).sort(), ["messages", "model"]);
+    // Last resort keeps a classic max_tokens ceiling — never an uncapped paid call.
+    assert.equal(calls[1]!.body.max_tokens, 2_048);
+    assert.equal(calls[1]!.body.max_completion_tokens, undefined);
+    assert.equal(calls[1]!.body.temperature, undefined);
+    assert.deepEqual(Object.keys(calls[1]!.body).sort(), [
+      "max_tokens",
+      "messages",
+      "model",
+    ]);
   });
 
   it("does not buy a second call for an unrelated rejection", async () => {
