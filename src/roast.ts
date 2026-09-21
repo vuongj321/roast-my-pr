@@ -690,10 +690,15 @@ function workersAiThinkingControl(model: string): Record<string, unknown> {
   return /glm|gemma|qwen/i.test(model) ? { thinking: { type: "disabled" } } : {};
 }
 
-/** Chat-template controls are per-model; drop ours if this model rejects it. */
+/**
+ * True when the gateway rejected a *request field* we sent — not the model, key,
+ * or quota. Used to shed extras / switch token-cap field and retry a plainer body.
+ * Bare "unsupported …" is not enough: "unsupported model: …" must fail once, not
+ * burn paid retries that cannot fix a bad model id.
+ */
 function isUnsupportedParameterError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? "");
-  return /unsupported|not supported|unknown (?:field|parameter)|unrecognized|invalid (?:field|parameter)|extra (?:inputs|fields)/i.test(
+  return /(?:unsupported|not supported|unknown|unrecognized|invalid)\s+(?:request\s+)?(?:argument|parameter|field)s?|extra (?:inputs|fields)/i.test(
     message,
   );
 }

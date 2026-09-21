@@ -390,6 +390,30 @@ describe("callOpenAICompatible", () => {
     );
     assert.equal(calls.length, 1);
   });
+
+  it("does not treat an unsupported model as a refused request field", async () => {
+    const calls = stubFetch(() =>
+      jsonResponse(
+        { error: { message: "unsupported model: gpt-9-omega" } },
+        400,
+      ),
+    );
+
+    await assert.rejects(
+      () =>
+        callOpenAICompatible({
+          provider: "OpenAI",
+          url: "https://api.openai.com/v1/chat/completions",
+          apiKey: "sk-test",
+          model: "gpt-9-omega",
+          userPrompt: "review this",
+          maxTokensField: "max_completion_tokens",
+          extraBody: { reasoning_effort: "low" },
+        }),
+      /unsupported model: gpt-9-omega/,
+    );
+    assert.equal(calls.length, 1);
+  });
 });
 
 describe("fetchWithTimeout", () => {
