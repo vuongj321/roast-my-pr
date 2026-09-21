@@ -29,6 +29,23 @@ describe("filePriority", () => {
   });
 });
 
+describe("provider budgets", () => {
+  it("gives the paid provider the largest pack", () => {
+    assert.ok(
+      PROVIDER_DIFF_BUDGETS.openai.maxTotalChars >
+        PROVIDER_DIFF_BUDGETS.gemini.maxTotalChars,
+    );
+    assert.ok(
+      PROVIDER_DIFF_BUDGETS.openai.maxPerFileChars >
+        PROVIDER_DIFF_BUDGETS.gemini.maxPerFileChars,
+    );
+    assert.ok(
+      PROVIDER_DIFF_BUDGETS.groq.maxTotalChars <
+        PROVIDER_DIFF_BUDGETS.workersai.maxTotalChars,
+    );
+  });
+});
+
 describe("isHighSignalPath", () => {
   it("flags env, schema, controllers, and package.json", () => {
     assert.equal(isHighSignalPath("apps/api/src/config/env.ts"), true);

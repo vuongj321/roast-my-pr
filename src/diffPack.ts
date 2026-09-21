@@ -495,6 +495,12 @@ export const PROVIDER_DIFF_BUDGETS = {
    */
   gemini: { maxTotalChars: 48_000, maxPerFileChars: 6_000, maxBodyChars: 2_500 },
   /**
+   * Paid OpenAI-compatible endpoint: no free-tier TPM/Neuron ceiling, so the pack
+   * is bounded by MAX_DIFF_CHARS (48k by default — raise it to unlock this).
+   * Still capped for latency: the roast runs inline before the webhook ack.
+   */
+  openai: { maxTotalChars: 120_000, maxPerFileChars: 12_000, maxBodyChars: 4_000 },
+  /**
    * Groq free `openai/gpt-oss-20b`: 8K TPM (not per-request). Keep the first
    * attempt small so a shrink-retry is not required (retries burn the same minute).
    */

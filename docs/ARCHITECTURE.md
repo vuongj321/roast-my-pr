@@ -10,13 +10,13 @@ It is **not**:
 
 - A GitHub Marketplace multi-tenant service other people install onto *your* hosting
 - An always-on virtual machine you babysit
-- A paid OpenAI/Anthropic integration
+- A paid OpenAI/Anthropic integration you must pay for (a paid OpenAI-**compatible** endpoint is optional, off by default, and free providers remain the fallback)
 
 It **is**:
 
 - A **self-hosted GitHub App** (account-only install)
 - Running on a **Cloudflare Worker** (serverless HTTP handler)
-- Powered by **free-tier LLMs** (Gemini primary, Workers AI, then optional Groq last)
+- Powered by **free-tier LLMs** (Gemini primary, Workers AI, then optional Groq last), plus an optional **paid OpenAI-compatible endpoint** that runs first when configured
 - Meant to be **cloned** by anyone who wants their own copy, with their own App, Worker, and API key
 
 ## 2. High-level system diagram
@@ -33,10 +33,11 @@ flowchart LR
     Worker[Cloudflare Worker]
     KV[KV rate-limit store]
     AIBind[Workers AI binding]
-    Secrets[Secrets APP_ID PRIVATE_KEY WEBHOOK_SECRET GEMINI_API_KEY optional GROQ]
+    Secrets[Secrets APP_ID PRIVATE_KEY WEBHOOK_SECRET GEMINI_API_KEY optional GROQ OPENAI]
   end
 
-  subgraph models [Free-tier LLMs]
+  subgraph models [LLM providers]
+    Paid["OpenAI-compatible paid optional"]
     Gemini[Gemini primary]
     Groq[Groq last resort]
     WorkersAI[Workers AI fallback]
@@ -49,16 +50,19 @@ flowchart LR
   AIBind --> Worker
   Worker -->|verify signature auth Octokit| Repos
   Worker --> KV
+  Worker -->|paid first when configured| Paid
+  Paid -.->|on failure or quota| Gemini
   Worker -->|diff plus roast prompt| Gemini
   Gemini -.->|on capacity or quota| WorkersAI
   WorkersAI -.->|on capacity or quota| Groq
+  Paid -->|roast text| Worker
   Gemini -->|roast text| Worker
   WorkersAI -->|roast text| Worker
   Groq -->|roast text| Worker
   Worker -->|post PR comment| Repos
 ```
 
-**One sentence:** GitHub notifies your Worker; the Worker proves the request is real, authenticates as your App, loads the PR diff, calls Gemini (with Workers AI / Groq failover), and writes the roast back to the PR.
+**One sentence:** GitHub notifies your Worker; the Worker proves the request is real, authenticates as your App, loads the PR diff, calls an optional paid OpenAI-compatible endpoint first and then Gemini (with Workers AI / Groq failover), and writes the roast back to the PR.
 
 ## 3. The four building blocks
 
@@ -93,12 +97,14 @@ Responsibilities of the Worker:
 4. Authenticate to the GitHub API as the App installation
 5. Fetch PR metadata and the diff
 6. Check a daily rate limit in KV
-7. Call an LLM with the roast prompt (Gemini → Workers AI → Groq)
+7. Call an LLM with the roast prompt (optional paid OpenAI-compatible endpoint first, then Gemini → Workers AI → Groq)
 8. Post the roast comment
 
 **Wrangler** is Cloudflare’s CLI used to develop (`wrangler dev`), set secrets, and deploy (`wrangler deploy`).
 
-### 3.3 Free-tier LLMs (the brain)
+### 3.3 LLM providers (the brain)
+
+An optional **paid OpenAI-compatible provider** is tried **first**. It needs both `OPENAI_API_KEY` and `OPENAI_MODEL` — a lone key is skipped with a log warning, and no model is assumed. It speaks Chat Completions (`POST {OPENAI_BASE_URL}/chat/completions` with Bearer auth), so the base URL can point at OpenAI or any compatible gateway. The body carries `temperature: 0.9` unless `OPENAI_REASONING_EFFORT` is set (the operator's signal that the model reasons, and reasoning models reject a non-default temperature), plus an output cap in `max_completion_tokens` (`OPENAI_MAX_TOKENS_FIELD` overrides; `omit` drops the cap). A gateway that rejects a field we added (`reasoning_effort`, the cap, `temperature`) is called again with a progressively plainer body — the last attempt is `model` + `messages` + classic `max_tokens` (never an uncapped paid completion) — so a narrow or older gateway costs one extra request instead of the whole paid provider. Every outbound call (Gemini included) is bounded by `LLM_TIMEOUT_MS` (30s) via `fetchWithTimeout`, and a timeout is never classified as quota, so the chain walks on rather than reporting a rate limit. Token usage reported by the provider is logged so paid spend is auditable.
 
 Google AI Studio issues a free-tier Gemini API key (required). **Workers AI** (via the Worker `AI` binding, no API key) is the first failover when Gemini hits capacity. Optional **Groq** is last resort: its free-tier pack is tiny (~6k chars) and weak models invent claims on thin slices. Workers AI free plan includes **10,000 Neurons/day**.
 
@@ -137,7 +143,7 @@ sequenceDiagram
     Worker->>GitHub: Fetch latest prior roast comment with its review state
     Worker->>GitHub: If state SHA is older, fetch the compare delta
     Worker->>Worker: Pack diff by hunk (boost prior-cited paths; provider budget)
-    Worker->>LLM: Gemini then Workers AI then Groq (findings + delta + diff)
+    Worker->>LLM: OpenAI (paid, optional) then Gemini then Workers AI then Groq (findings + delta + diff)
     LLM-->>Worker: Roast markdown plus F1/F2 accounting lines
     Worker->>Worker: Drop unpacked-path bullets and self-contradicting repeats
     Worker->>GitHub: Post roast comment whose footer carries the new review state
@@ -162,16 +168,18 @@ sequenceDiagram
 
 6. **Rate limit** — Check and increment the daily roast counter in KV. If over the cap, post a limit message and stop.
 
-7. **Context load** — Fetch PR title, body, changed files, patches, and the head SHA. Then load the latest prior Roast my PR comment (footer-marked) and read the machine-readable **review state** hidden in its footer: the SHA that was reviewed plus addressable findings (`F1`, `F2`, …). When that SHA differs from the current head, ask the compare API for what was pushed since — that delta is the only input which actually distinguishes "still broken" from "not shown to you". Roasts posted before review state existed carry none, so findings are derived from their bullets instead. Paths cited there are prioritized when packing so re-roasts can verify old findings. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
+7. **Context load** — Fetch PR title, body, changed files, patches, the head SHA, and the PR's commit subjects (first lines, capped at 12). The subjects are the stated intent the model must treat as a deliberate tradeoff rather than a defect. Then load the latest prior Roast my PR comment (footer-marked) and read the machine-readable **review state** hidden in its footer (comments are walked newest-first, capped at three pages, so a long thread cannot hide the latest roast): the SHA that was reviewed plus addressable findings (`F1`, `F2`, …). When that SHA differs from the current head, ask the compare API for what was pushed since — that delta is the only input which actually distinguishes "still broken" from "not shown to you". Roasts posted before review state existed carry none, so findings are derived from their bullets instead. Paths cited there are prioritized when packing so re-roasts can verify old findings. Diffs are not dumped raw into one megaprompt; they are packed later per provider.
 
-8. **Roast generation** — For each provider (Gemini → Workers AI → Groq): pack the file list into that provider’s character budget, call the API/binding, and on “request too large” (or empty completion for non-Groq providers) shrink 50% and retry once. Groq requests set `include_reasoning: false` / `reasoning_effort: low` so answers land in `content`. Response parsing prefers `content`/`response`; `reasoning` is only accepted when it looks like a finished roast. What the prompt contains matters as much as the budget:
+8. **Roast generation** — For each provider in priority order (optional paid OpenAI-compatible → Gemini → Workers AI → Groq): pack the file list into that provider’s character budget, call the API/binding, and on “request too large” (or empty completion for non-Groq providers) shrink 50% and retry once. Groq requests set `include_reasoning: false` / `reasoning_effort: low` so answers land in `content`. Response parsing prefers `content`/`response`; `reasoning` is only accepted when it looks like a finished roast. What the prompt contains matters as much as the budget:
    - **Files are packed by hunk, not by tail.** A file whose patch exceeds the per-file cap keeps its *added-code-dense* hunks and drops the rest, with `[partial: 3 of 8 hunks]` on the header and `… [n hunks not shown]` gap markers. Truncating from the top of a patch is what hid transaction wrappers and validation written at the bottom of a 12 KB file.
    - **Partial coverage is stated, not implied.** Every clipped file is listed under “Partially shown files”, and the system prompt forbids claiming code is missing when it may simply be outside what was shown.
    - **The review delta is carved out of the same budget** (30%), so adding a delta never pushes a free-tier prompt past its limit.
    - **Prior findings must be accounted for**: the model emits one `- F1 resolved` / `- F2 still present — "<quote>"` / `- F3 unverifiable` line per finding before the roast, and is told never to re-raise something it marked resolved.
-9. **Post-processing** — Strip the `F1/F2` accounting block, drop bullets that cite file paths not in the packed set, then drop bullets that contradict the accounting by re-raising a resolution the model itself declared. If the run covered less than half the changed files, prepend a visible `Partial review: only N of M changed files…` banner.
+   - **The paid provider uses a different request shape.** No `temperature`, output capped with `max_completion_tokens`, optional `reasoning_effort`, and a 120k-char budget that `MAX_DIFF_CHARS` still clamps. The `usage` it reports is logged for cost auditing.
+   - **A scratchpad is not a review.** Workers AI reasoning families (GLM, Gemma, Qwen) are called with `thinking: { type: "disabled" }`; if a model rejects that control the call is retried once without it rather than dropping the provider. Every answer is then checked for the roast format: `content` must carry a structure (a `What I'd send back` heading, or a headline plus cited-path bullets), and any reply that trips the planning detector — bolded process labels (`*Refining "Fix it"*:`), prompt-field echoes (`PR Title: …`, `Author: @x`), label-only bullets, or first-person narration (`I'll focus on…`, `Wait, check…`) — is rejected so the chain falls through to the next provider. A dump never gets the 50% shrink retry: it is not a size problem, and on the paid provider it would just be a second invoice.
+9. **Post-processing** — Strip the `F1/F2` accounting block, drop bullets that cite file paths not in the packed set, then drop bullets that contradict the accounting by re-raising a resolution the model itself declared. If the run saw less than half the changed files, **or** the pack clipped patch text, append a visible coverage note under the footer attribution: after Gemini `Partial review: only N of M changed files fitted the provider's budget (~P% of the diff text)…`, after Workers AI / Groq the louder ``Partial review via fallback model (`groq`): … Claims outside the packed slice are unverified.`` PRs with fewer than 8 changed files skip the note.
 
-10. **Final comment** — Post one markdown comment on the PR (v1 does not create inline review threads on specific lines). Its footer carries the reviewed SHA plus the findings parsed from this roast, so the *next* run has state instead of prose to reconcile against.
+10. **Final comment** — Post one markdown comment on the PR (v1 does not create inline review threads on specific lines). Its footer carries the reviewed SHA plus the findings parsed from this roast, so the *next* run has state instead of prose to reconcile against. State is only written from a roast that passed the format gate, and a prior comment that is a planning dump contributes neither findings nor SHA to the next run — prompt echoes like `Author: @x` must never become something the model is asked to mark resolved.
 
 11. **HTTP response** — Return success to GitHub. Webhook handlers should acknowledge promptly; heavy work still happens in the same invocation for MVP (Workers have CPU/time limits—keep prompts and diffs bounded).
 
@@ -186,15 +194,17 @@ roast-my-pr/
     app.ts                   # issue_comment handling and /roastmypr routing
     command.ts               # Parse first-line /roastmypr
     github.ts                # App JWT, installation Octokit, PR context, compare delta, comments
-    diffPack.ts              # Noise filtering, hunk-level packing, per-provider budgets
+    diffPack.ts              # Noise filtering, priority ranking, hunk packing, per-provider budgets
     pathFilter.ts            # Path/evidence/intent filters, F1 accounting, hedge strip
-    roast.ts                 # LLM client with Gemini → Workers AI → Groq failover
+    roast.ts                 # LLM client with OpenAI (paid) → Gemini → Workers AI → Groq
     responseText.ts          # Normalize / extract usable model completions
     prompts.ts               # Roast personality, review state, coverage warnings
     rateLimit.ts             # KV daily caps
     types.ts                 # Env, command, finding and review-state types
+    *.test.ts                # Node test-runner suites (npm test)
   docs/
     ARCHITECTURE.md          # This file
+    GITHUB_APP_SETUP.md      # Create the App: permissions, PKCS#8 key, smee, install
   README.md                  # Self-host setup guide
 ```
 
@@ -203,16 +213,16 @@ roast-my-pr/
 | `index.ts` | Cloudflare `fetch` handler; webhook path; signature check; JSON parse |
 | `app.ts` | Business rules: is this `/roastmypr`? orchestrate rate limit, review state, delta, roast, reply |
 | `command.ts` | Parse the first line of a comment for `/roastmypr` |
-| `github.ts` | All GitHub API interaction through Octokit (prior roast lookup with state, compare delta, comments) |
-| `diffPack.ts` | Skip noisy files, prioritize source / prior-cited paths, pack patches by hunk to a budget, report partial coverage |
+| `github.ts` | All GitHub API interaction through Octokit (prior roast lookup with state, newest-first bounded paging, compare delta, comments) |
+| `diffPack.ts` | Skip noisy files; rank the rest by tier (source → other → config → tests → docs), then deleted, then renamed, then high-signal paths (`package.json`, `env.*`/`schema.*`, `*controller*`), then larger patches, with paths cited in a prior roast pulled to the front; pack patches by hunk to a budget; report partial coverage |
 | `pathFilter.ts` | Drop bullets citing unpacked paths or unverified absolute claims; strip Fix-its that undo commit constraints; strip F1/F2 accounting and hedge closers |
-| `roast.ts` | Multi-provider LLM request/response, per-provider packing, delta budget, failover, post-processing |
-| `responseText.ts` | Turn provider JSON into plain roast text; prefer `content` over unfinished reasoning |
+| `roast.ts` | Multi-provider LLM request/response in `PROVIDER_PRIORITY` order (paid → Gemini → Workers AI → Groq), per-provider packing, delta budget, failover, post-processing |
+| `responseText.ts` | Turn provider JSON into plain roast text; require the roast structure, reject planning dumps / prompt echoes, prefer `content` over unfinished reasoning |
 | `prompts.ts` | Prompt text, footer/state round-trip, finding parsing, partial-coverage banner |
 | `rateLimit.ts` | Read/increment KV counters (`RATE_LIMIT` binding required) |
 | `types.ts` | Shared `Env`, `RoastCommand`, `PriorFinding`, `RoastState`, `PackCoverage` types |
 
-### 4.1 Review memory (why a re-roast does not repeat a fixed item)
+### 5.1 Review memory (why a re-roast does not repeat a fixed item)
 
 Prose reviews cannot answer "did the author fix F2?" on a later run — the next model sees a *cumulative* base…head diff and a wall of prior text, so anything the packer clipped reads as "still missing". Three pieces of state close that gap:
 
@@ -254,12 +264,13 @@ Secrets live in Cloudflare Worker secrets (or local `.dev.vars` for development)
 - `WEBHOOK_SECRET`
 - `GEMINI_API_KEY`
 - `GROQ_API_KEY` (optional failover)
+- `OPENAI_API_KEY` (optional paid provider — ignored unless `OPENAI_MODEL` is also set; `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_REASONING_EFFORT`, and `OPENAI_MAX_TOKENS_FIELD` go in `wrangler.toml` `[vars]` or as secrets, and the template ships all of them commented out)
 - Workers AI uses the wrangler `[ai]` binding (`env.AI`) — no secret. Override model with `WORKERS_AI_MODEL`.
 - If migrating from OpenRouter: `npx wrangler secret delete OPENROUTER_API_KEY`
 
 ### 6.4 Trust and privacy
 
-The Worker receives PR diffs for repos where the App is installed. For a self-hosted, account-only bot, that means **your** repos and **your** API keys. Diffs go to Gemini first; on failover they may also be sent to Groq and/or Workers AI. Free-tier providers may use prompts/responses to improve products—document that for operators of a self-hosted copy.
+The Worker receives PR diffs for repos where the App is installed. For a self-hosted, account-only bot, that means **your** repos and **your** API keys. With a paid provider configured, diffs go to that vendor (OpenAI, or whatever `OPENAI_BASE_URL` points at) **first**—their data policy applies and you pay per token. Otherwise, and whenever the paid call fails, diffs go to Gemini, and on failover they may also be sent to Groq and/or Workers AI. Free-tier providers may use prompts/responses to improve products—document both policies for operators of a self-hosted copy.
 
 ## 7. Local development vs production
 
@@ -268,7 +279,7 @@ The Worker receives PR diffs for repos where the App is installed. For a self-ho
 ```mermaid
 flowchart LR
   GitHub -->|HTTPS webhook| WorkerURL["worker.workers.dev"]
-  WorkerURL --> LLM[Gemini Groq WorkersAI]
+  WorkerURL --> LLM[OpenAI paid optional, Gemini, Groq, WorkersAI]
 ```
 
 Webhook URL on the GitHub App points at the deployed Worker.
@@ -281,7 +292,7 @@ GitHub cannot reach `localhost` directly. A relay such as **smee.io** provides a
 flowchart LR
   GitHub -->|webhook| Smee[smee.io public URL]
   Smee -->|forward| Local["wrangler dev on localhost"]
-  Local --> LLM[Gemini Groq WorkersAI]
+  Local --> LLM[OpenAI paid optional, Gemini, Groq, WorkersAI]
 ```
 
 Flow for a developer:
@@ -291,6 +302,15 @@ Flow for a developer:
 3. Temporarily set the App webhook URL to the smee URL
 4. Comment `/roastmypr` on a test PR in an installed repo
 5. After deploy, point the webhook back at the production Worker URL
+
+### Checks before shipping a change
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm test            # Node test runner over src/*.test.ts
+```
+
+The suites cover command parsing, packing and hunk selection, the path/evidence/intent filters, review-state round-trip, and provider response parsing — all pure functions, so they need no Cloudflare credentials or network access.
 
 ## 8. Distribution and tenancy
 
@@ -311,8 +331,12 @@ They do **not** install your App onto their account when the App is **Only on th
 | Comment on a non-PR issue | Ignore |
 | Bot-authored comment | Ignore (prevent loops) |
 | Command without install / missing permission | Error comment or logged failure; no crash loop |
+| Paid key invalid, revoked, or out of quota | Failure logged (with token usage when the vendor reports it); the run cascades to Gemini |
+| Paid gateway refuses `reasoning_effort`, the token cap, or `temperature` | The field is shed and the call retried with a plainer body (last attempt: `model` + `messages` + `max_tokens`); the roast still comes from the paid provider |
+| A provider stops answering | Each outbound call is bounded by a 30s deadline; the failure is logged and the chain moves to the next provider |
+| `OPENAI_API_KEY` set without `OPENAI_MODEL` (or vice versa) | Paid provider skipped with a logged warning; the free tiers handle the roast |
 | Diff too large | Truncate; note in roast that review is partial |
-| Provider budget covers less than half the PR | Roast is prefixed `Partial review: only N of M changed files…`; clipped files are named to the model |
+| Provider budget covers less than half the PR, or patch text was clipped | Roast ends with the coverage note under the footer attribution; Workers AI / Groq runs get the louder "Partial review via fallback model" variant. Clipped files are named to the model. PRs with fewer than 8 changed files are exempt |
 | Author pushes fixes, then re-runs the bot | Compare delta injected as "changes pushed since that review"; every finding must be answered `resolved` / `still present` / `unverifiable` |
 | Reviewed SHA is gone (force-push/rebase) | Compare fails; the run continues without a delta and unseen findings become `unverifiable` |
 | Model re-raises something it marked resolved | Bullet is dropped by the repeat filter before posting |
@@ -326,7 +350,7 @@ They do **not** install your App onto their account when the App is **Only on th
 - Auto-roast on every `pull_request` opened
 - Bring-your-own-key dashboards
 - GitHub Marketplace listing
-- Paid-only model fallbacks (Groq free tier + Workers AI free Neurons only)
+- Requiring a paid provider (a paid OpenAI-compatible endpoint is opt-in and off by default; the free tiers remain sufficient)
 
 ## 11. Mental model summary
 
@@ -334,7 +358,7 @@ Think of the system as three doors and one brain:
 
 1. **GitHub App door** — Who is allowed to act in which repos, and which events are sent  
 2. **Worker door** — Public HTTPS endpoint that only trusts signed GitHub traffic  
-3. **LLM brain** — Turns diff + roast instructions into the comment text (Gemini, with Workers AI / Groq failover)
+3. **LLM brain** — Turns diff + roast instructions into the comment text (optional paid OpenAI-compatible endpoint first, then Gemini, with Workers AI / Groq failover)
 4. **KV latch** — Stops you from accidentally exhausting free-tier quota  
 
 The slash command is only a **user-facing trigger**. All real work is webhook → verify → auth → diff → model → comment.

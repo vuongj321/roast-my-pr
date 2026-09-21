@@ -22,7 +22,22 @@ GROQ_MODEL = "openai/gpt-oss-20b"
 WORKERS_AI_MODEL = "@cf/google/gemma-4-26b-a4b-it"
 DAILY_ROAST_LIMIT = "20"
 # Global ceiling applied on top of per-provider budgets (see src/diffPack.ts).
+# The paid provider's own budget is larger (120000) — raise this if you want a
+# paid run to use that headroom.
 MAX_DIFF_CHARS = "48000"
+
+# Optional paid OpenAI-compatible provider. The provider runs ONLY when the
+# OPENAI_API_KEY secret *and* a model are both set (see `isOpenAiEnabled` in
+# src/roast.ts), and this template ships neither: deploying the repo as-is must
+# not send PR diffs to a paid vendor. Opt in by setting a model here or as a
+# secret, and keep the key a secret:
+#   npx wrangler secret put OPENAI_API_KEY
+#   npx wrangler secret put OPENAI_MODEL
+# There is no default model.
+# OPENAI_MODEL = "gpt-5.6-terra"
+# OPENAI_BASE_URL = "https://api.openai.com/v1"       # any OpenAI-shaped gateway
+# OPENAI_REASONING_EFFORT = "low"                     # reasoning models only
+# OPENAI_MAX_TOKENS_FIELD = "max_completion_tokens"   # or max_tokens / omit
 
 [observability]
 enabled = true
