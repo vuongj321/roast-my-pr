@@ -7,7 +7,7 @@ import {
   type PackOptions,
   type ProviderName,
 } from "./diffPack.js";
-import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting, stripHedgeCloser, filterUnverifiedAbsoluteClaims, dropIntentContradictingFixIts } from "./pathFilter.js";
+import { filterRoastByPackedPaths, dropResolvedRepeats, parseFindingAccounting, stripHedgeCloser, filterUnverifiedAbsoluteClaims } from "./pathFilter.js";
 import {
   buildPartialReviewNote,
   buildUserPrompt,
@@ -1079,17 +1079,7 @@ export async function generateRoast(
         );
       }
 
-      const intented = dropIntentContradictingFixIts(
-        deduped.text,
-        input.commitMessages ?? [],
-      );
-      if (intented.dropped > 0) {
-        console.error(
-          `Roast intent filter (${attempt.name}): dropped=${intented.dropped} Fix-it bullet(s) undoing stated commit constraints`,
-        );
-      }
-
-      const dehedged = stripHedgeCloser(intented.text);
+      const dehedged = stripHedgeCloser(deduped.text);
 
       const coverageNote = buildPartialReviewNote(coverage, {
         provider: attempt.name,

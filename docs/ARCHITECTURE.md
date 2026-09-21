@@ -113,7 +113,7 @@ The Worker sends:
 - A **system prompt** (roast personality, rules, output shape)
 - A **user payload** (PR title, body, **packed** file patches)
 
-Packing is **provider-specific**. Gemini can take a larger diff; Workers AI uses a moderate pack to preserve the daily neuron budget; Groq’s free-tier **8K TPM** forces the tightest pack and is tried last. On failover we rebuild a pack for that provider instead of resending the Gemini-sized prompt. Noisy files (lockfiles, images, `dist/`, etc.) are skipped and listed as omitted so the model still knows they changed. Paths cited in a prior roast are packed first. After the model replies, bullets that cite file paths **not** in the packed set are stripped, absolute claims without a quote from the packed diff are dropped, and Fix-it bullets that undo stated commit constraints are removed.
+Packing is **provider-specific**. Gemini can take a larger diff; Workers AI uses a moderate pack to preserve the daily neuron budget; Groq’s free-tier **8K TPM** forces the tightest pack and is tried last. On failover we rebuild a pack for that provider instead of resending the Gemini-sized prompt. Noisy files (lockfiles, images, `dist/`, etc.) are skipped and listed as omitted so the model still knows they changed. Paths cited in a prior roast are packed first. After the model replies, bullets that cite file paths **not** in the packed set are stripped, and absolute claims without a quote from the packed diff are dropped.
 
 The first successful provider returns text; the Worker posts that text to GitHub. Gemini and Groq are external HTTP APIs; Workers AI runs through Cloudflare’s `env.AI` binding.
 
@@ -195,7 +195,7 @@ roast-my-pr/
     command.ts               # Parse first-line /roastmypr
     github.ts                # App JWT, installation Octokit, PR context, compare delta, comments
     diffPack.ts              # Noise filtering, priority ranking, hunk packing, per-provider budgets
-    pathFilter.ts            # Path/evidence/intent filters, F1 accounting, hedge strip
+    pathFilter.ts            # Path/evidence filters, F1 accounting, hedge strip
     roast.ts                 # LLM client with OpenAI (paid) → Gemini → Workers AI → Groq
     responseText.ts          # Normalize / extract usable model completions
     prompts.ts               # Roast personality, review state, coverage warnings
@@ -215,7 +215,7 @@ roast-my-pr/
 | `command.ts` | Parse the first line of a comment for `/roastmypr` |
 | `github.ts` | All GitHub API interaction through Octokit (prior roast lookup with state, newest-first bounded paging, compare delta, comments) |
 | `diffPack.ts` | Skip noisy files; rank the rest by tier (source → other → config → tests → docs), then deleted, then renamed, then high-signal paths (`package.json`, `env.*`/`schema.*`, `*controller*`), then larger patches, with paths cited in a prior roast pulled to the front; pack patches by hunk to a budget; report partial coverage |
-| `pathFilter.ts` | Drop bullets citing unpacked paths or unverified absolute claims; strip Fix-its that undo commit constraints; strip F1/F2 accounting and hedge closers |
+| `pathFilter.ts` | Drop bullets citing unpacked paths or unverified absolute claims; strip F1/F2 accounting and hedge closers |
 | `roast.ts` | Multi-provider LLM request/response in `PROVIDER_PRIORITY` order (paid → Gemini → Workers AI → Groq), per-provider packing, delta budget, failover, post-processing |
 | `responseText.ts` | Turn provider JSON into plain roast text; require the roast structure, reject planning dumps / prompt echoes, prefer `content` over unfinished reasoning |
 | `prompts.ts` | Prompt text, footer/state round-trip, finding parsing, partial-coverage banner |
@@ -310,7 +310,7 @@ npm run typecheck   # tsc --noEmit
 npm test            # Node test runner over src/*.test.ts
 ```
 
-The suites cover command parsing, packing and hunk selection, the path/evidence/intent filters, review-state round-trip, and provider response parsing — all pure functions, so they need no Cloudflare credentials or network access.
+The suites cover command parsing, packing and hunk selection, the path/evidence filters, review-state round-trip, and provider response parsing — all pure functions, so they need no Cloudflare credentials or network access.
 
 ## 8. Distribution and tenancy
 
