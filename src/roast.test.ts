@@ -406,6 +406,53 @@ describe("fetchWithTimeout", () => {
     );
   });
 
+  it("gives up when headers arrive but the body never finishes", async () => {
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          init?.signal?.addEventListener("abort", () => {
+            stream.error(
+              Object.assign(new Error("aborted"), { name: "AbortError" }),
+            );
+          });
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    await assert.rejects(
+      () =>
+        fetchWithTimeout(
+          "OpenAI",
+          "https://api.openai.com/v1/chat/completions",
+          {},
+          5,
+        ),
+      /did not answer within 5ms/,
+    );
+  });
+
+  it("returns parsed JSON after a complete round trip", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({ ok: true, value: 7 })) as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout<{ ok: boolean; value: number }>(
+      "Gemini",
+      "https://gateway.example/v1/messages",
+      {},
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.data, { ok: true, value: 7 });
+  });
+
   it("reports a connection failure as itself, not as a timeout", async () => {
     globalThis.fetch = (async () => {
       throw new TypeError("fetch failed: ECONNREFUSED");

@@ -356,24 +356,40 @@ function formatDuration(ms: number): string {
   return ms >= 1_000 ? `${Math.round(ms / 1_000)}s` : `${ms}ms`;
 }
 
+/** Result of a timed JSON round trip: status plus parsed body. */
+export type TimedJsonResponse<T = unknown> = {
+  ok: boolean;
+  status: number;
+  data: T;
+};
+
 /**
- * POST to a provider with a deadline. The roast runs inline in the webhook, so a
- * provider that stops answering costs the whole comment — not just its own turn
- * — while the next provider in the chain would have answered. A timeout is never
- * "quota-like", so the chain keeps walking instead of reporting a rate limit.
+ * POST to a provider with a deadline that covers the whole round trip — headers
+ * and body. The roast runs inline in the webhook, so a vendor that sends 200 and
+ * then stalls mid-body would otherwise hold the comment open while the next
+ * provider in the chain would have answered. A timeout is never "quota-like", so
+ * the chain keeps walking instead of reporting a rate limit.
  */
-export async function fetchWithTimeout(
+export async function fetchWithTimeout<T = unknown>(
   provider: string,
   url: string,
   init: RequestInit,
   timeoutMs: number = LLM_TIMEOUT_MS,
-): Promise<Response> {
+): Promise<TimedJsonResponse<T>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    // Read under the same deadline: fetch resolves on headers, and a stalled
+    // body is the hang this helper exists to cut short.
+    const data = (await res.json()) as T;
+    return { ok: res.ok, status: res.status, data };
   } catch (err) {
-    const aborted = err instanceof Error && err.name === "AbortError";
+    // signal.aborted covers body reads that throw a non-AbortError once the
+    // timer fires (cancelled stream / TypeError), not only fetch() itself.
+    const aborted =
+      controller.signal.aborted ||
+      (err instanceof Error && err.name === "AbortError");
     const message = aborted
       ? `${provider} did not answer within ${formatDuration(timeoutMs)}.`
       : err instanceof Error
@@ -393,39 +409,41 @@ async function callGemini(env: Env, userPrompt: string): Promise<string> {
   const model = geminiModel(env);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
-  const res = await fetchWithTimeout("Gemini", url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: ROAST_SYSTEM_PROMPT }],
-      },
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: userPrompt }],
+  const { ok, status, data } = await fetchWithTimeout<GeminiResponse>(
+    "Gemini",
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: ROAST_SYSTEM_PROMPT }],
         },
-      ],
-      generationConfig: {
-        temperature: 0.9,
-        // Thinking tokens count against this cap; keep headroom for the roast body.
-        maxOutputTokens: 8192,
-        // Gemini 3.x defaults to MEDIUM thinking and can burn the whole budget
-        // before finishing the markdown reply (finishReason MAX_TOKENS mid-bullet).
-        thinkingConfig: {
-          thinkingLevel: "minimal",
-          thinkingBudget: 0,
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: userPrompt }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.9,
+          // Thinking tokens count against this cap; keep headroom for the roast body.
+          maxOutputTokens: 8192,
+          // Gemini 3.x defaults to MEDIUM thinking and can burn the whole budget
+          // before finishing the markdown reply (finishReason MAX_TOKENS mid-bullet).
+          thinkingConfig: {
+            thinkingLevel: "minimal",
+            thinkingBudget: 0,
+          },
         },
-      },
-    }),
-  });
+      }),
+    },
+  );
 
-  const data = (await res.json()) as GeminiResponse;
-
-  if (!res.ok) {
-    const message = data.error?.message || `Gemini HTTP ${res.status}`;
+  if (!ok) {
+    const message = data.error?.message || `Gemini HTTP ${status}`;
     const quotaLike =
-      isRetryableStatus(res.status) ||
+      isRetryableStatus(status) ||
       data.error?.status === "RESOURCE_EXHAUSTED" ||
       isQuotaLikeMessage(message);
     throw Object.assign(new Error(message), {
@@ -599,26 +617,29 @@ export async function callOpenAICompatible(options: {
   let refusedField: Error | undefined;
 
   for (let index = 0; index < bodies.length; index += 1) {
-    const res = await fetchWithTimeout(options.provider, options.url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${options.apiKey}`,
-        ...options.extraHeaders,
+    const { ok, status, data } = await fetchWithTimeout<OpenAIChatResponse>(
+      options.provider,
+      options.url,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${options.apiKey}`,
+          ...options.extraHeaders,
+        },
+        body: JSON.stringify(bodies[index]),
       },
-      body: JSON.stringify(bodies[index]),
-    });
+    );
 
-    const data = (await res.json()) as OpenAIChatResponse;
     // Logged before the error checks: a failed call still burns tokens, which
     // matters most on the paid provider.
     logOpenAiUsage(options.provider, data);
 
-    if (!res.ok) {
+    if (!ok) {
       const message =
-        data.error?.message || `${options.provider} HTTP ${res.status}`;
+        data.error?.message || `${options.provider} HTTP ${status}`;
       const error = Object.assign(new Error(message), {
-        quotaLike: isRetryableStatus(res.status) || isQuotaLikeMessage(message),
+        quotaLike: isRetryableStatus(status) || isQuotaLikeMessage(message),
         tooLarge: isPromptTooLargeMessage(message),
         emptyCompletion: false,
       });
