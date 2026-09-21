@@ -2,13 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   ABSOLUTE_CLAIM_STRIPPED_NOTE,
-  INTENT_FIXIT_STRIPPED_NOTE,
   INCOMPLETE_PACK_NOTE,
   PATH_STRIPPED_NOTE,
   absoluteClaimHasPackedEvidence,
   bulletPathsArePacked,
   bulletRepeatsFinding,
-  dropIntentContradictingFixIts,
   dropResolvedRepeats,
   filterRoastByPackedPaths,
   filterUnverifiedAbsoluteClaims,
@@ -299,40 +297,5 @@ describe("filterUnverifiedAbsoluteClaims", () => {
       absoluteClaimHasPackedEvidence("- never guards against +++ headers", packed),
       false,
     );
-  });
-});
-
-describe("dropIntentContradictingFixIts", () => {
-  it("drops Fix-its that undo footer-state constraints from commits", () => {
-    const roast = `Headline.
-
-### What I'd send back
-- The footer carries state.
-
-### Fix it
-- Remove the hidden roastmypr-state comment and serialize in a dedicated JSON block.
-- Align the types with the returned object.
-`;
-    const { text, dropped } = dropIntentContradictingFixIts(roast, [
-      "feat(roast): remember findings in footer — no KV binding needed",
-      "docs: document hidden state footer",
-    ]);
-    assert.equal(dropped, 1);
-    assert.match(text, new RegExp(INTENT_FIXIT_STRIPPED_NOTE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.doesNotMatch(text, /Remove the hidden/);
-    assert.match(text, /Align the types/);
-  });
-
-  it("is a no-op without constraint-like commits", () => {
-    const roast = `Headline.
-
-### Fix it
-- Remove the hidden state comment.
-`;
-    const { dropped, text } = dropIntentContradictingFixIts(roast, [
-      "feat: add widgets",
-    ]);
-    assert.equal(dropped, 0);
-    assert.match(text, /Remove the hidden/);
   });
 });

@@ -117,7 +117,9 @@ describe("ROAST_SYSTEM_PROMPT", () => {
     assert.match(ROAST_SYSTEM_PROMPT, /commit subjects as stated intent/);
     assert.match(ROAST_SYSTEM_PROMPT, /append-only/);
     assert.match(ROAST_SYSTEM_PROMPT, /grain of salt/);
-    assert.match(ROAST_SYSTEM_PROMPT, /document leftover/);
+    assert.match(ROAST_SYSTEM_PROMPT, /leftovers and type drift/);
+    assert.doesNotMatch(ROAST_SYSTEM_PROMPT, /A "Fix it" section/);
+    assert.match(ROAST_SYSTEM_PROMPT, /Each bullet names an issue only/);
   });
 });
 
@@ -223,17 +225,14 @@ describe("parseFindingsFromRoast", () => {
 - The slug fallback in \`apps/api/src/orgs/orgs.service.ts\` never retries after a clash.
 - Invite expiry is never enforced in \`apps/api/src/orgs/orgs.service.ts\`.
 
-### Fix it
-1. Bulk-revoke pending invites in one UPDATE.
-
 Grudging respect.
 `;
     const findings = parseFindingsFromRoast(roast);
 
-    assert.equal(findings.length, 3);
+    assert.equal(findings.length, 2);
     assert.equal(findings[0]!.id, "F1");
     assert.equal(findings[0]!.path, "apps/api/src/orgs/orgs.service.ts");
-    assert.match(findings[2]!.text, /Bulk-revoke/);
+    assert.match(findings[1]!.text, /Invite expiry/);
   });
 
   it("ignores planning labels and prompt echoes", () => {
@@ -330,13 +329,13 @@ describe("buildUserPrompt review state", () => {
 });
 
 describe("truncatePriorRoast tail", () => {
-  it("keeps the Fix it list at the end of a long prior roast", () => {
-    const long = `${"headline words ".repeat(400)}TAIL_FIX_IT_LIST`;
+  it("keeps the end of a long prior roast", () => {
+    const long = `${"headline words ".repeat(400)}TAIL_CLOSER_LINE`;
     const out = truncatePriorRoast(long);
 
     assert.ok(out.length <= MAX_PRIOR_ROAST_CHARS);
     assert.match(out, /prior roast truncated/);
-    assert.match(out, /TAIL_FIX_IT_LIST/);
+    assert.match(out, /TAIL_CLOSER_LINE/);
   });
 });
 
