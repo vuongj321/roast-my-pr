@@ -15,9 +15,6 @@ export const INCOMPLETE_PACK_NOTE =
 export const ABSOLUTE_CLAIM_STRIPPED_NOTE =
   "_Note: Some absolute claims lacked a quote present in the packed diff and were omitted._";
 
-export const INTENT_FIXIT_STRIPPED_NOTE =
-  "_Note: Some Fix-it bullets contradicted stated commit constraints and were omitted._";
-
 /** Split a section body into bullet blocks (`-` / `*` / numbered). */
 export function splitBulletBlocks(sectionBody: string): string[] {
   const lines = sectionBody.split(/\r?\n/);
@@ -318,83 +315,6 @@ export function filterUnverifiedAbsoluteClaims(
     {
       some: ABSOLUTE_CLAIM_STRIPPED_NOTE,
       all: ABSOLUTE_CLAIM_STRIPPED_NOTE,
-    },
-  );
-}
-
-/** Commit subjects that look like deliberate constraints / tradeoffs. */
-const CONSTRAINT_COMMIT_RE =
-  /\b(cannot|can't|won't|will not|append-?only|intentionally|keep unused|no kv|footer|hidden state|out of scope|trade-?off|accepted risk|we chose|not doing|postgres cannot)\b/i;
-
-/** Fix-it language that undoes a documented constraint. */
-const UNDO_CONSTRAINT_RE =
-  /\b(drop (?:the )?(?:enum|values|legacy)|remove (?:the )?(?:hidden |state |footer|comment)|reinstate|undo|delete (?:the )?state|serialize (?:in|as) (?:a )?json|dedicated json)\b/i;
-
-type ConstraintTopic = "enum" | "state";
-
-function constraintTopics(text: string): Set<ConstraintTopic> {
-  const t = text.toLowerCase();
-  const topics = new Set<ConstraintTopic>();
-  if (/enum|postgres|append/.test(t)) topics.add("enum");
-  if (/footer|state|hidden|kv|comment/.test(t)) topics.add("state");
-  return topics;
-}
-
-/**
- * Drop Fix-it bullets that demand undoing a constraint stated in commit subjects.
- */
-export function dropIntentContradictingFixIts(
-  roastText: string,
-  commitMessages: readonly string[],
-): { text: string; kept: number; dropped: number } {
-  const parsed = parseRoastSections(roastText);
-  if (!parsed.structured || parsed.fixItBlocks.length === 0) {
-    return { text: parsed.raw, kept: 0, dropped: 0 };
-  }
-
-  const constraints = (commitMessages ?? []).filter((m) =>
-    CONSTRAINT_COMMIT_RE.test(m),
-  );
-  if (constraints.length === 0) {
-    return { text: parsed.raw, kept: 0, dropped: 0 };
-  }
-
-  const stated = new Set<ConstraintTopic>();
-  for (const c of constraints) {
-    for (const topic of constraintTopics(c)) stated.add(topic);
-  }
-  if (stated.size === 0) {
-    return { text: parsed.raw, kept: 0, dropped: 0 };
-  }
-
-  let dropped = 0;
-  const keptFix: string[] = [];
-  for (const block of parsed.fixItBlocks) {
-    if (!UNDO_CONSTRAINT_RE.test(block)) {
-      keptFix.push(block);
-      continue;
-    }
-    const bulletTopics = constraintTopics(block);
-    const contradicts = [...bulletTopics].some((t) => stated.has(t));
-    if (contradicts) {
-      dropped += 1;
-      continue;
-    }
-    keptFix.push(block);
-  }
-
-  if (dropped === 0) {
-    return { text: parsed.raw, kept: 0, dropped: 0 };
-  }
-
-  return rebuildRoastSections(
-    parsed,
-    parsed.sendBackBlocks,
-    keptFix,
-    dropped,
-    {
-      some: INTENT_FIXIT_STRIPPED_NOTE,
-      all: INTENT_FIXIT_STRIPPED_NOTE,
     },
   );
 }
