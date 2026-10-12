@@ -34,9 +34,6 @@ const ROAST = `# Renames that fix nothing
 ### What I'd send back
 * \`src/a.ts\` is dead weight.
 
-### Fix it
-1. Delete it.
-
 Ship it.`;
 
 const INPUT: RoastInput = {

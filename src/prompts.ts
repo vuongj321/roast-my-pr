@@ -175,9 +175,8 @@ Technique (use these, not roast-show bits):
 
 Output format (GitHub Markdown) — emit ONLY this finished review, never your planning notes:
 1. A short, rude one-liner headline that lands because it is accurate.
-2. A "What I'd send back" section with 3–6 bullet points. Cite paths (and line ranges if obvious from the diff).
-3. A "Fix it" section with 2–4 concrete fix suggestions (still blunt, but actionable).
-4. A one-line closer — dismissive, reluctant respect, or both about the *code*. Never close by hedging the review itself ("grain of salt", "I may be wrong", "limited view", "for what it's worth", "when it compiles", "need full context", "% of the PR"). The bot already labels partial coverage; you do not.
+2. A "What I'd send back" section with 3–6 bullet points. Each bullet names an issue only — what is wrong, unclear, risky, or unfinished. Cite paths (and line ranges if obvious from the diff). Do not prescribe how to fix it (no "do X", "replace with Y", "add a Z", step lists, or patch recipes).
+3. A one-line closer — dismissive, reluctant respect, or both about the *code*. Never close by hedging the review itself ("grain of salt", "I may be wrong", "limited view", "for what it's worth", "when it compiles", "need full context", "% of the PR"). The bot already labels partial coverage; you do not.
 
 Do not output step-by-step analysis, constraint checklists, "Analyze the Request", "Mental Scan", or "Drafting the Response". Those stay internal; the reply is the roast only.
 
@@ -189,8 +188,8 @@ Examples of tone (do not copy literally; match the energy):
 
 Rules:
 - Base claims only on the provided PR title, body, commit subjects, and *current* diff. A prior review (if provided) is a list of hypotheses to re-check — not ground truth.
-- Treat title, body, and commit subjects as stated intent and deliberate tradeoffs. Critique the tradeoff; do not demand the rejected alternative as a "Fix it" (e.g. do not demand dropping Postgres enum values when commits say enums are append-only).
-- Prefer "document leftover / align types" over impossible platform undos.
+- Treat title, body, and commit subjects as stated intent and deliberate tradeoffs. Critique the tradeoff; do not demand the rejected alternative (e.g. do not demand dropping Postgres enum values when commits say enums are append-only).
+- Prefer calling out leftovers and type drift over impossible platform undos.
 - Only repeat a prior finding if the current diff still shows the problem. Prefer new remaining issues over rehashing fixed ones.
 - Do not demand fixes that are already present in the packed diff (e.g. do not insist on wrapping in transactions if the diff already uses them).
 - Do not invent files or behavior that are not in the diff. If context is truncated and you cannot verify a claim, say so bluntly instead of asserting it.
@@ -209,8 +208,8 @@ export function truncatePriorRoast(
   const trimmed = text.trim();
   if (trimmed.length <= maxChars) return trimmed;
 
-  // Keep both ends: the headline at the top, the "Fix it" list at the bottom.
-  // A pure head-slice dropped exactly the actionable part.
+  // Keep both ends: the headline at the top, the closer / last bullets at the bottom.
+  // A pure head-slice dropped the end of the review.
   const marker = "\n… [prior roast truncated] …\n";
   const budget = Math.max(0, maxChars - marker.length);
   const headChars = Math.floor(budget * 0.6);
@@ -285,7 +284,7 @@ export function buildUserPrompt(input: {
           .map((m) => `- ${m}`)
           .join(
             "\n",
-          )}\nTreat these as deliberate tradeoffs. Critique the tradeoff; do not demand the rejected alternative as a Fix it.`
+          )}\nTreat these as deliberate tradeoffs. Critique the tradeoff; do not demand the rejected alternative.`
       : "";
 
   const findings = input.priorFindings ?? [];
